@@ -1,0 +1,31 @@
+# Environment
+backend/.env
+.env
+**/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Java / AS400
+backend/lib/jt400.jar
+
+# Frontend build
+frontend/build/
+frontend/node_modules/
+
+# Roba vecchia / archivi
+as400_web/
+as400_web_backend.zip
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

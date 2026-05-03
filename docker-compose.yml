@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  mongo:
+    image: mongo:7
+    restart: always
+    volumes:
+      - mongo_data:/data/db
+
+  app:
+    build: .
+    restart: always
+    ports:
+      - "127.0.0.1:8003:8003"
+    depends_on:
+      - mongo
+    env_file:
+      - backend/.env
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - STATIC_DIR=/app/frontend/build
+
+volumes:
+  mongo_data:
