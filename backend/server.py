@@ -373,7 +373,8 @@ async def get_me(user = Depends(get_current_user)):
         "plan": user.get("plan", "starter"),
         "plan_status": user.get("plan_status", "trial"),
         "trial_ends": user.get("trial_ends", "").isoformat() if user.get("trial_ends") else None,
-        "plan_expires": user.get("plan_expires", "").isoformat() if user.get("plan_expires") else None
+        "plan_expires": user.get("plan_expires", "").isoformat() if user.get("plan_expires") else None,
+        "is_admin": user.get("is_admin", False)
     }
 
 @api_router.post("/auth/change-password")
