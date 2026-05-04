@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
@@ -497,11 +497,23 @@ def _test_as400_connection(host: str, user: str, password: str) -> dict:
 
 @api_router.post("/import")
 async def import_data(
-    request: ImportRequest,
     file: UploadFile = File(...),
+    connection_id: str = Form(...),
+    library: str = Form(...),
+    table_name: str = Form(...),
+    mode: str = Form(...),
+    field_config: Optional[str] = Form(None),
     user = Depends(require_active_plan),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
+    import json
+    request = ImportRequest(
+        connection_id=connection_id,
+        library=library,
+        table_name=table_name,
+        mode=mode,
+        field_config=json.loads(field_config) if field_config else None
+    )
     # Controlla limite righe mensili
     plan_id = user.get("plan", "starter")
     plan = PLANS.get(plan_id, PLANS["starter"])
