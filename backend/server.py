@@ -24,6 +24,14 @@ import resend
 import asyncio
 import json
 
+# ── LOCAL MODE ────────────────────────────────────────────────
+# Se LOCAL_MODE=true l'app gira sul PC del cliente nella sua rete.
+# Niente PayPal, niente trial, niente limitazioni di piano.
+# La licenza viene verificata all'avvio contro il server cloud.
+LOCAL_MODE = os.environ.get("LOCAL_MODE", "false").lower() == "true"
+LICENSE_KEY = os.environ.get("LICENSE_KEY", "")
+LICENSE_SERVER = os.environ.get("LICENSE_SERVER", "https://as400.ikonetsolutions.com")
+
 # ── LOGGING ──────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -56,11 +64,12 @@ PAYPAL_SECRET     = os.environ.get("PAYPAL_SECRET", "sb")
 PAYPAL_MODE       = os.environ.get("PAYPAL_MODE", "sandbox")
 FRONTEND_URL      = os.environ.get("FRONTEND_URL", "https://as400.ikonetsolutions.com")
 
-paypalrestsdk.configure({
-    "mode": PAYPAL_MODE,
-    "client_id": PAYPAL_CLIENT_ID,
-    "client_secret": PAYPAL_SECRET
-})
+if not LOCAL_MODE:
+    paypalrestsdk.configure({
+        "mode": PAYPAL_MODE,
+        "client_id": PAYPAL_CLIENT_ID,
+        "client_secret": PAYPAL_SECRET
+    })
 
 # ── PIANI ABBONAMENTO ─────────────────────────────────────────
 PLANS = {
@@ -153,6 +162,91 @@ app.add_middleware(
 )
 
 security = HTTPBearer()
+
+# ══════════════════════════════════════════════════════════════
+#  LOCAL MODE HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def get_hardware_id() -> str:
+    import hashlib, uuid
+    return hashlib.sha256(str(uuid.getnode()).encode()).hexdigest()[:32]
+
+async def validate_license_online(key: str) -> dict:
+    import socket, httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(f"{LICENSE_SERVER}/api/license/verify", json={
+                "license_key": key,
+                "hardware_id": get_hardware_id(),
+                "hostname": socket.gethostname()
+            })
+            if r.status_code == 200:
+                return {"valid": True, **r.json()}
+            return {"valid": False, "error": r.json().get("detail", "Licenza non valida")}
+    except Exception as e:
+        logger.error(f"Errore verifica licenza online: {e}")
+        return {"valid": False, "error": f"Server non raggiungibile: {e}"}
+
+async def _get_license_cache() -> dict:
+    doc = await db.license_cache.find_one({"key": "current"})
+    return doc["data"] if doc else {"valid": False, "error": "Licenza non ancora verificata"}
+
+async def revalidate_license():
+    if not LICENSE_KEY:
+        return
+    result = await validate_license_online(LICENSE_KEY)
+    await db.license_cache.replace_one(
+        {"key": "current"},
+        {"key": "current", "data": result, "validated_at": datetime.now(timezone.utc)},
+        upsert=True
+    )
+    logger.info(f"Licenza ri-verificata: valid={result.get('valid')}")
+
+@app.on_event("startup")
+async def startup_event():
+    if not LOCAL_MODE:
+        return
+    logger.info("=== LOCAL MODE ATTIVO ===")
+    if not LICENSE_KEY:
+        logger.error("LOCAL_MODE: variabile LICENSE_KEY non impostata")
+        return
+
+    # Valida licenza contro il server cloud
+    result = await validate_license_online(LICENSE_KEY)
+    await db.license_cache.replace_one(
+        {"key": "current"},
+        {"key": "current", "data": result, "validated_at": datetime.now(timezone.utc)},
+        upsert=True
+    )
+    if result["valid"]:
+        logger.info(f"Licenza valida — piano: {result.get('plan')} — scade: {result.get('expires_at')}")
+    else:
+        logger.warning(f"Licenza non valida: {result.get('error')}")
+
+    # Crea utente admin di default al primo avvio
+    count = await db.users.count_documents({})
+    if count == 0:
+        default_pwd = secrets.token_urlsafe(12)
+        await db.users.insert_one({
+            "_id": ObjectId(),
+            "email": "admin@local",
+            "password": hash_password(default_pwd),
+            "name": "Admin",
+            "company": "Locale",
+            "role": "admin",
+            "plan": result.get("plan", "starter"),
+            "plan_status": "active",
+            "plan_expires": None,
+            "trial_ends": None,
+            "is_active": True,
+            "is_admin": True,
+            "created_at": datetime.now(timezone.utc)
+        })
+        logger.info("╔══════════════════════════════════════╗")
+        logger.info("║     CREDENZIALI PRIMO ACCESSO        ║")
+        logger.info("║  Email:    admin@local               ║")
+        logger.info(f"║  Password: {default_pwd:<26}║")
+        logger.info("╚══════════════════════════════════════╝")
 
 # ══════════════════════════════════════════════════════════════
 #  MODELS
@@ -261,7 +355,20 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Token non valido")
 
 async def require_active_plan(user = Depends(get_current_user)):
-    """Verifica che l'utente abbia un piano attivo o trial"""
+    if LOCAL_MODE:
+        lic = await _get_license_cache()
+        if not lic.get("valid"):
+            raise HTTPException(status_code=403, detail=f"Licenza non valida: {lic.get('error', '')}. Contatta il supporto.")
+        # Ri-verifica in background ogni 24h
+        doc = await db.license_cache.find_one({"key": "current"})
+        if doc:
+            validated_at = doc.get("validated_at")
+            if validated_at:
+                age = datetime.now(timezone.utc) - validated_at.replace(tzinfo=timezone.utc)
+                if age > timedelta(hours=24):
+                    asyncio.create_task(revalidate_license())
+        return user
+    # Cloud mode
     plan_status = user.get("plan_status", "trial")
     if plan_status == "expired":
         raise HTTPException(status_code=403, detail="Abbonamento scaduto. Rinnova il piano per continuare.")
@@ -358,7 +465,8 @@ async def login(data: UserLogin):
             "plan": user.get("plan", "starter"),
             "plan_status": user.get("plan_status", "trial"),
             "trial_ends": user.get("trial_ends", "").isoformat() if user.get("trial_ends") else None,
-            "plan_expires": user.get("plan_expires", "").isoformat() if user.get("plan_expires") else None
+            "plan_expires": user.get("plan_expires", "").isoformat() if user.get("plan_expires") else None,
+            "is_admin": user.get("is_admin", False)
         }
     }
 
@@ -412,17 +520,18 @@ async def get_connections(user = Depends(require_active_plan)):
 
 @api_router.post("/connections")
 async def create_connection(data: AS400Connection, user = Depends(require_active_plan)):
-    # Controlla limite connessioni del piano
     count = await db.connections.count_documents(
         {"user_id": str(user["_id"]), "is_deleted": {"$ne": True}}
     )
-    if not check_plan_limit(user, "connections", count):
+    if LOCAL_MODE:
+        lic = await _get_license_cache()
+        max_conn = lic.get("max_connections", 1)
+        if max_conn != -1 and count >= max_conn:
+            raise HTTPException(status_code=403, detail=f"Limite connessioni raggiunto ({max_conn}). Contatta il supporto per aggiornare la licenza.")
+    elif not check_plan_limit(user, "connections", count):
         plan = PLANS.get(user.get("plan", "starter"))
         max_conn = plan["limits"]["connections"]
-        raise HTTPException(
-            status_code=403,
-            detail=f"Limite connessioni raggiunto ({max_conn}). Aggiorna il piano."
-        )
+        raise HTTPException(status_code=403, detail=f"Limite connessioni raggiunto ({max_conn}). Aggiorna il piano.")
 
     # Cripta la password
     import base64
@@ -452,6 +561,20 @@ async def delete_connection(conn_id: str, user = Depends(get_current_user)):
     )
     return {"message": "Connessione eliminata"}
 
+def _is_private_ip(host: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private
+    except ValueError:
+        # hostname, not an IP — resolve and check
+        import socket
+        try:
+            resolved = socket.gethostbyname(host)
+            return ipaddress.ip_address(resolved).is_private
+        except Exception:
+            return False
+
 @api_router.post("/connections/{conn_id}/test")
 async def test_connection(conn_id: str, user = Depends(require_active_plan)):
     conn = await db.connections.find_one(
@@ -459,6 +582,16 @@ async def test_connection(conn_id: str, user = Depends(require_active_plan)):
     )
     if not conn:
         raise HTTPException(status_code=404, detail="Connessione non trovata")
+
+    host = conn["host"]
+    if not LOCAL_MODE and _is_private_ip(host):
+        return {
+            "success": False,
+            "message": (
+                f"Connessione in rete locale ({host}) non raggiungibile dal cloud. "
+                "Installa l'agent locale nella rete del cliente."
+            )
+        }
 
     try:
         import base64
@@ -476,13 +609,12 @@ async def test_connection(conn_id: str, user = Depends(require_active_plan)):
         return {"success": False, "message": str(e)}
 
 def _test_as400_connection(host: str, user: str, password: str) -> dict:
-    """Test connessione AS/400 sincrona (eseguita in thread)"""
     try:
         import jaydebeapi
         jar_path = os.path.join(ROOT_DIR, "lib", "jt400.jar")
         url = (f"jdbc:as400://{host};"
                f"user={user};password={password};"
-               f"prompt=false;secure=false")
+               f"prompt=false;secure=false;loginTimeout=15")
         conn = jaydebeapi.connect(
             "com.ibm.as400.access.AS400JDBCDriver",
             url, [user, password], jar_path
@@ -490,7 +622,10 @@ def _test_as400_connection(host: str, user: str, password: str) -> dict:
         conn.close()
         return {"success": True, "message": "Connessione riuscita"}
     except Exception as e:
-        return {"success": False, "message": str(e)}
+        msg = str(e)
+        if "loginTimeout" in msg or "timed out" in msg.lower() or "timeout" in msg.lower():
+            return {"success": False, "message": f"Timeout connessione a {host}: il server non risponde entro 15 secondi."}
+        return {"success": False, "message": msg}
 
 # ══════════════════════════════════════════════════════════════
 #  IMPORT
@@ -520,8 +655,7 @@ async def import_data(
     plan = PLANS.get(plan_id, PLANS["starter"])
     max_rows = plan["limits"]["rows_per_month"]
 
-    if max_rows != -1:
-        # Conta righe importate questo mese
+    if not LOCAL_MODE and max_rows != -1:
         month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0)
         rows_this_month = await db.operations.aggregate([
             {"$match": {
@@ -776,10 +910,10 @@ async def get_saved_queries(user = Depends(get_current_user)):
 
 @api_router.post("/saved-queries")
 async def save_query(data: SavedQuery, user = Depends(require_active_plan)):
-    # Controlla limite saved queries
-    count = await db.saved_queries.count_documents({"user_id": str(user["_id"])})
-    if not check_plan_limit(user, "saved_queries", count):
-        raise HTTPException(status_code=403, detail="Limite saved queries raggiunto. Aggiorna il piano.")
+    if not LOCAL_MODE:
+        count = await db.saved_queries.count_documents({"user_id": str(user["_id"])})
+        if not check_plan_limit(user, "saved_queries", count):
+            raise HTTPException(status_code=403, detail="Limite saved queries raggiunto. Aggiorna il piano.")
 
     result = await db.saved_queries.insert_one({
         "user_id": str(user["_id"]),
@@ -1077,11 +1211,33 @@ async def send_trial_reminders(user = Depends(get_current_user)):
         await db.users.update_one({"_id": u["_id"]}, {"$set": {"trial_reminder_sent": True}})
     return {"sent": sent}
 
-app.include_router(api_router)
+# ══════════════════════════════════════════════════════════════
+#  LOCAL MODE ENDPOINTS
+# ══════════════════════════════════════════════════════════════
 
-# Serve frontend statico
-if os.path.exists("/app/frontend/build"):
-    app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
+@api_router.get("/license/status")
+async def license_status(user = Depends(get_current_user)):
+    if not LOCAL_MODE:
+        raise HTTPException(status_code=404)
+    doc = await db.license_cache.find_one({"key": "current"})
+    if not doc:
+        return {"valid": False, "error": "Licenza non ancora verificata"}
+    return {
+        **doc["data"],
+        "validated_at": doc["validated_at"].isoformat()
+    }
+
+@api_router.post("/license/revalidate")
+async def license_revalidate(user = Depends(get_current_user)):
+    if not LOCAL_MODE:
+        raise HTTPException(status_code=404)
+    result = await validate_license_online(LICENSE_KEY)
+    await db.license_cache.replace_one(
+        {"key": "current"},
+        {"key": "current", "data": result, "validated_at": datetime.now(timezone.utc)},
+        upsert=True
+    )
+    return result
 
 # Forgot password endpoint (aggiunto)
 
@@ -1202,3 +1358,9 @@ async def reset_hardware(license_key: str, user=Depends(get_current_user)):
         {"$set": {"hardware_id": None, "hostname": None, "suspicious_attempts": 0}}
     )
     return {"message": "Hardware reset eseguito"}
+
+app.include_router(api_router)
+
+# Serve frontend statico
+if os.path.exists("/app/frontend/build"):
+    app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
