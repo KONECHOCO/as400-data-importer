@@ -12,7 +12,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, timedelta
 import bcrypt
 import jwt
 import secrets
@@ -608,6 +608,7 @@ async def _run_import(op_id, content, ext, request, user, plan):
             {"$set": {
                 "status": "completed" if result["success"] else "failed",
                 "result": result,
+                "error": result.get("error") if not result["success"] else None,
                 "completed_at": datetime.now(timezone.utc)
             }}
         )
@@ -1082,3 +1083,121 @@ if os.path.exists("/app/frontend/build"):
     app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
 
 # Forgot password endpoint (aggiunto)
+
+
+# ══════════════════════════════════════════════════════════════
+#  LICENSE MANAGEMENT
+# ══════════════════════════════════════════════════════════════
+
+def generate_license_key(customer_id: str) -> str:
+    import hashlib, hmac as _hmac
+    LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "ikonet-license-secret-2024")
+    raw = f"{customer_id}-{secrets.token_hex(8)}"
+    h = _hmac.new(LICENSE_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:12].upper()
+    return f"IKONET-{h[0:4]}-{h[4:8]}-{h[8:12]}"
+
+class LicenseActivateRequest(BaseModel):
+    license_key: str
+    hardware_id: str
+    hostname: str
+    ip: Optional[str] = None
+
+class LicenseIssueRequest(BaseModel):
+    user_id: str
+    plan: str
+    expires_days: int = 365
+    max_connections: int = 1
+    notes: Optional[str] = ""
+
+@api_router.post("/license/verify")
+async def verify_license(req: LicenseActivateRequest):
+    lic = await db.licenses.find_one({"license_key": req.license_key})
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+    now = datetime.now(timezone.utc)
+    expires_at = lic.get("expires_at")
+    if expires_at and expires_at.replace(tzinfo=timezone.utc) < now:
+        raise HTTPException(status_code=403, detail="Licenza scaduta")
+    if lic.get("revoked"):
+        raise HTTPException(status_code=403, detail="Licenza revocata")
+    registered_hw = lic.get("hardware_id")
+    if not registered_hw:
+        await db.licenses.update_one(
+            {"license_key": req.license_key},
+            {"$set": {"hardware_id": req.hardware_id, "hostname": req.hostname,
+                      "first_activated": now, "last_seen": now, "ip": req.ip}}
+        )
+    elif registered_hw != req.hardware_id:
+        await db.licenses.update_one(
+            {"license_key": req.license_key},
+            {"$inc": {"suspicious_attempts": 1}, "$set": {"last_seen": now}}
+        )
+        raise HTTPException(status_code=403, detail="Licenza gia attivata su un altro dispositivo")
+    else:
+        await db.licenses.update_one(
+            {"license_key": req.license_key},
+            {"$set": {"last_seen": now, "hostname": req.hostname}}
+        )
+    return {
+        "valid": True,
+        "plan": lic.get("plan", "starter"),
+        "expires_at": lic.get("expires_at").isoformat() if lic.get("expires_at") else None,
+        "max_connections": lic.get("max_connections", 1),
+        "customer": lic.get("customer_name", ""),
+        "features": lic.get("features", ["import", "export"])
+    }
+
+@api_router.get("/admin/licenses")
+async def list_licenses(user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    licenses = await db.licenses.find().sort("created_at", -1).to_list(200)
+    for l in licenses:
+        l["_id"] = str(l["_id"])
+    return licenses
+
+@api_router.post("/admin/licenses")
+async def create_license(req: LicenseIssueRequest, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    key = generate_license_key(req.user_id)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=req.expires_days)
+    doc = {
+        "license_key": key,
+        "user_id": req.user_id,
+        "plan": req.plan,
+        "expires_at": expires_at,
+        "max_connections": req.max_connections,
+        "notes": req.notes,
+        "revoked": False,
+        "hardware_id": None,
+        "hostname": None,
+        "suspicious_attempts": 0,
+        "features": ["import", "export", "query"],
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.licenses.insert_one(doc)
+    doc["_id"] = str(doc["_id"])
+    return {"license_key": key, "expires_at": expires_at.isoformat(), **doc}
+
+@api_router.post("/admin/licenses/{license_key}/revoke")
+async def revoke_license(license_key: str, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    result = await db.licenses.update_one(
+        {"license_key": license_key},
+        {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc)}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+    return {"message": "Licenza revocata"}
+
+@api_router.post("/admin/licenses/{license_key}/reset-hardware")
+async def reset_hardware(license_key: str, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    await db.licenses.update_one(
+        {"license_key": license_key},
+        {"$set": {"hardware_id": None, "hostname": None, "suspicious_attempts": 0}}
+    )
+    return {"message": "Hardware reset eseguito"}

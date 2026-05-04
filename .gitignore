@@ -29,3 +29,4 @@ as400_web_backend.zip
 # OS
 .DS_Store
 Thumbs.db
+agent/lib/jt400.jar
