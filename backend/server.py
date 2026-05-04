@@ -648,11 +648,14 @@ def _sync_import(host, user, password, library, table_name, mode, df, field_conf
             try:
                 cursor.execute(f"CREATE TABLE {library}.{table_name} ({cols_sql})")
                 conn.commit()
-            except Exception:
-                pass  # Tabella già esistente
+            except Exception as create_err:
+                err_msg = str(create_err).lower()
+                if "already exists" not in err_msg and "sql0601" not in err_msg and "duplicate" not in err_msg:
+                    raise Exception(f"Errore creazione tabella {library}.{table_name}: {create_err}")
 
         # Insert/Update
         inserted = 0
+        errors = []
         if mode in ["create", "insert"]:
             cols_str = ", ".join(columns)
             placeholders = ", ".join(["?" for _ in columns])
@@ -664,17 +667,19 @@ def _sync_import(host, user, password, library, table_name, mode, df, field_conf
                     try:
                         cursor.execute(sql, vals)
                         inserted += 1
-                    except:
-                        pass
+                    except Exception as row_err:
+                        errors.append(str(row_err))
                 conn.commit()
 
         cursor.close()
         conn.close()
+        if errors:
+            return {"success": False, "error": f"Errore import: {errors[0]}", "inserted": inserted, "total": len(data_rows), "errors": errors[:5]}
         return {"success": True, "inserted": inserted, "total": len(data_rows)}
 
     except Exception as e:
-        return {"success": False, "error": str(e)}
-
+        import traceback
+        return {"success": False, "error": str(e), "detail": traceback.format_exc()}
 @api_router.get("/import/{op_id}/status")
 async def get_import_status(op_id: str, user = Depends(get_current_user)):
     op = await db.operations.find_one({"id": op_id, "user_id": str(user["_id"])})
