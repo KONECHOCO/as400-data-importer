@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build outputs
+dist/
+dist_windows/
+dist_windows_new/
+build_work/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+*.env
+
+# Database (local data)
+*.db
+*.sqlite
+
+# Logs
+*.log
+error.log
+
+# Session token
+.session_token
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NSIS output
+windows_build/AS400Importer-Setup.exe
+
+# Certificates / secrets
+*.pfx
+*.p12
+*.key
+*.pem
