@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 1, 0),
-    prodvers=(1, 0, 1, 0),
+    filevers=(1, 0, 2, 0),
+    prodvers=(1, 0, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName',      u'Ikonet Solutions'),
             StringStruct(u'FileDescription',  u'AS400 Data Importer — Import ed Export AS/400 semplificato'),
-            StringStruct(u'FileVersion',      u'1.0.1.0'),
+            StringStruct(u'FileVersion',      u'1.0.2.0'),
             StringStruct(u'InternalName',     u'AS400Importer'),
             StringStruct(u'LegalCopyright',   u'Copyright © 2025 Ikonet Solutions. Tutti i diritti riservati.'),
             StringStruct(u'OriginalFilename', u'AS400Importer.exe'),
             StringStruct(u'ProductName',      u'AS400 Data Importer'),
-            StringStruct(u'ProductVersion',   u'1.0.1.0'),
+            StringStruct(u'ProductVersion',   u'1.0.2.0'),
           ]
         )
       ]
