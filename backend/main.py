@@ -38,10 +38,17 @@ ALGO     = "HS256"
 AS400_DRIVER = "com.ibm.as400.access.AS400JDBCDriver"
 
 # In frozen mode (PyInstaller), lib/ is alongside the exe — set via env var from run.py
-if os.environ.get('AS400_JT400_JAR'):
-    JT400_JAR = os.environ['AS400_JT400_JAR']
-else:
-    JT400_JAR = os.path.join(os.path.dirname(__file__), "lib", "jt400.jar")
+def _jt400_jar_path() -> str:
+    """Return the configured JT400 driver path with a clear error if missing."""
+    jar_path = os.environ.get("AS400_JT400_JAR") or os.path.join(
+        os.path.dirname(__file__), "lib", "jt400.jar"
+    )
+    if not os.path.exists(jar_path):
+        raise FileNotFoundError(
+            "Driver JT400 non trovato. Verifica che jt400.jar sia in backend/lib/ "
+            "oppure imposta AS400_JT400_JAR."
+        )
+    return jar_path
 
 pwd_ctx  = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
@@ -83,23 +90,24 @@ def _require_license():
         raise HTTPException(402, status.get("reason", "Licenza non attiva"))
 
 # ── AS/400 helpers ────────────────────────────────────────────────────────────
-def _as400_url(host: str, library: str, ssl: bool, timeout: int) -> str:
+def _as400_url(host: str, port: int, library: str, ssl: bool, timeout: int) -> str:
     lib = library if library and library != "*LIBL" else ""
+    port_part = f":{port}" if port else ""
     return (
-        f"jdbc:as400://{host}/{lib}"
+        f"jdbc:as400://{host}{port_part}/{lib}"
         f";prompt=false;secure={'true' if ssl else 'false'}"
         f";loginTimeout={timeout};date format=iso;time format=iso"
         f";translate binary=true"
     )
 
-def _open_jdbc(host, user, password, library="*LIBL", ssl=False, timeout=10):
-    url = _as400_url(host, library, ssl, timeout)
-    return jaydebeapi.connect(AS400_DRIVER, url, [user, password], JT400_JAR)
+def _open_jdbc(host, user, password, port=446, library="*LIBL", ssl=False, timeout=10):
+    url = _as400_url(host, port, library, ssl, timeout)
+    return jaydebeapi.connect(AS400_DRIVER, url, [user, password], _jt400_jar_path())
 
 def _test_jdbc(c: dict) -> dict:
     try:
         pw = decrypt(c["password_encrypted"])
-        conn = _open_jdbc(c["host"], c["as400_user"], pw, c["library"], bool(c["ssl"]), c["login_timeout"])
+        conn = _open_jdbc(c["host"], c["as400_user"], pw, c["port"], c["library"], bool(c["ssl"]), c["login_timeout"])
         cur = conn.cursor()
         cur.execute("SELECT CURRENT_DATE, CURRENT_TIME FROM SYSIBM.SYSDUMMY1")
         row = cur.fetchone()
@@ -130,7 +138,7 @@ def _run_query(c: dict, sql: str, limit: int) -> dict:
     is_sel = sql_up.startswith("SELECT") or sql_up.startswith("WITH")
     if is_sel and "FETCH FIRST" not in sql_up and limit > 0:
         sql = sql.rstrip(";") + f" FETCH FIRST {limit} ROWS ONLY"
-    conn = _open_jdbc(c["host"], c["as400_user"], pw, c["library"], bool(c["ssl"]), c["login_timeout"])
+    conn = _open_jdbc(c["host"], c["as400_user"], pw, c["port"], c["library"], bool(c["ssl"]), c["login_timeout"])
     cur = conn.cursor()
     try:
         cur.execute(sql)
@@ -488,7 +496,7 @@ async def do_import(
             def open_conn():
                 return _open_jdbc(
                     c["host"], c["as400_user"], decrypt(c["password_encrypted"]),
-                    c["library"], bool(c["ssl"]), c["login_timeout"]
+                    c["port"], c["library"], bool(c["ssl"]), c["login_timeout"]
                 )
             inserted, errors = fh_import_df(df, mapping, open_conn, library, table_name, mode, op_id, _pending)
             logs = [{"row": e["row"], "type": "error", "msg": e["error"]} for e in errors]
