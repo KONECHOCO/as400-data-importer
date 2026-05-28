@@ -82,7 +82,6 @@ export default function Import() {
   const [mapping, setMapping]   = useState([])
 
   // Step 3
-  const [opId, setOpId]         = useState(null)
   const [status, setStatus]     = useState(null)
   const pollRef                 = useRef()
   const logEndRef               = useRef()
@@ -142,7 +141,6 @@ export default function Import() {
     fd.append('options', JSON.stringify(fileOptions))
     try {
       const res = await api.post('/api/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
-      setOpId(res.data.operation_id)
       setStatus({ status: 'running', progress: 0, rows_count: 0, rows_error: 0, total_rows: null, log: [] })
       setStep(3)
       pollRef.current = setInterval(async () => {
@@ -163,7 +161,7 @@ export default function Import() {
 
   const reset = () => {
     setStep(1); setFile(null); setPreview(null); setMapping([])
-    setOpId(null); setStatus(null); setError(''); setLoading(false)
+    setStatus(null); setError(''); setLoading(false)
     setFileOptions({})
     clearInterval(pollRef.current)
   }

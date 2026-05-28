@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import api, { licenseApi } from '../services/api'
+import { licenseApi } from '../services/api'
 
 export default function Plans() {
   const [licState, setLicState] = useState(null)
@@ -21,7 +21,7 @@ export default function Plans() {
     if (!key.trim()) { setKeyError('Inserisci una chiave licenza'); return }
     setKeyError(''); setKeySuccess(''); setActivating(true)
     try {
-      const res = await licenseApi.activate(key.trim())
+      await licenseApi.activate(key.trim())
       setKeySuccess('Licenza attivata con successo!')
       setKey('')
       await fetchStatus()

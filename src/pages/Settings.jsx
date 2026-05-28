@@ -85,7 +85,7 @@ export default function Settings() {
     try {
       await api.put('/api/settings', appSettings)
       setSettingsMsg({ type: 'success', text: 'Impostazioni salvate' })
-    } catch (err) {
+    } catch {
       setSettingsMsg({ type: 'error', text: 'Errore salvataggio impostazioni' })
     } finally { setSettingsSaving(false) }
   }

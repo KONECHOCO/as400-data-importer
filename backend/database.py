@@ -110,6 +110,7 @@ def init_db():
         "ALTER TABLE connections ADD COLUMN user_id TEXT",
         "ALTER TABLE saved_queries ADD COLUMN user_id TEXT",
         "ALTER TABLE license ADD COLUMN trial_started_at TEXT",
+        "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             db.execute(migration)

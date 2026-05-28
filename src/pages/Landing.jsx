@@ -8,7 +8,7 @@ export default function Landing() {
 
   useEffect(() => {
     if (user) navigate('/dashboard', { replace: true })
-  }, [user])
+  }, [navigate, user])
 
   return (
     <div className="min-h-screen bg-[#0d0f1a] text-white">

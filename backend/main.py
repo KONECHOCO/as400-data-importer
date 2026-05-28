@@ -12,7 +12,7 @@ from passlib.context import CryptContext
 
 import jaydebeapi
 
-from .database     import init_db, get_db
+from .database     import DB_PATH, init_db, get_db
 from .crypto       import encrypt, decrypt
 from .license_mgr  import get_status, activate as lic_activate, get_hardware_id
 from .email_service import (
@@ -33,7 +33,7 @@ import pandas as pd
 from fastapi.responses import Response as FastAPIResponse
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
-SECRET   = "ikonet-local-secret-2026"
+SECRET   = os.environ.get("AS400_SECRET_KEY", "ikonet-local-secret-2026")
 ALGO     = "HS256"
 AS400_DRIVER = "com.ibm.as400.access.AS400JDBCDriver"
 
@@ -53,7 +53,12 @@ def _jt400_jar_path() -> str:
 pwd_ctx  = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
 app = FastAPI(title="Ikonet AS400 Local Agent")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("AS400_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if origin.strip()
+]
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 init_db()
 
@@ -79,7 +84,12 @@ def _get_user(authorization: str = Header(None)):
     return dict(row)
 
 def _pub(u: dict) -> dict:
-    return {k: v for k, v in u.items() if k != "password_hash"}
+    public = {k: v for k, v in u.items() if k != "password_hash"}
+    public["is_admin"] = bool(public.get("is_admin"))
+    return public
+
+def _setting_key(user_id: str, key: str) -> str:
+    return f"{user_id}:{key}"
 
 # ── License guard ─────────────────────────────────────────────────────────────
 def _require_license():
@@ -237,6 +247,8 @@ class UpdateProfileBody(BaseModel):
 @app.post("/api/auth/setup")
 def setup_account(b: SetupBody):
     """Prima configurazione — solo se nessun utente esiste (primo avvio)."""
+    if len(b.password) < 6:
+        raise HTTPException(400, "La password deve essere di almeno 6 caratteri")
     db = get_db()
     if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
         db.close()
@@ -256,6 +268,8 @@ def register(b: SetupBody):
     """Registrazione libera — qualsiasi email nuova può creare un account."""
     if not b.email or not b.password or not b.name:
         raise HTTPException(400, "Email, password e nome sono obbligatori")
+    if len(b.password) < 6:
+        raise HTTPException(400, "La password deve essere di almeno 6 caratteri")
     db = get_db()
     existing = db.execute("SELECT id FROM users WHERE email=?", (b.email.lower().strip(),)).fetchone()
     if existing:
@@ -274,7 +288,7 @@ def register(b: SetupBody):
 @app.post("/api/auth/login")
 def login(b: LoginBody):
     db = get_db()
-    row = db.execute("SELECT * FROM users WHERE email=?", (b.email,)).fetchone()
+    row = db.execute("SELECT * FROM users WHERE LOWER(email)=?", (b.email.lower().strip(),)).fetchone()
     db.close()
     if not row or not pwd_ctx.verify(b.password, row["password_hash"]):
         raise HTTPException(401, "Credenziali non valide")
@@ -287,6 +301,8 @@ def me(user=Depends(_get_user)):
 
 @app.post("/api/auth/change-password")
 def change_password(b: ChangePwdBody, user=Depends(_get_user)):
+    if len(b.new_password) < 6:
+        raise HTTPException(400, "La nuova password deve essere di almeno 6 caratteri")
     if not pwd_ctx.verify(b.current_password, user["password_hash"]):
         raise HTTPException(400, "Password attuale non corretta")
     db = get_db()
@@ -676,7 +692,11 @@ def list_operations(user=Depends(_get_user)):
 @app.get("/api/settings")
 def get_settings(user=Depends(_get_user)):
     db   = get_db()
-    rows = {r["key"]: r["value"] for r in db.execute("SELECT key, value FROM settings").fetchall()}
+    prefix = _setting_key(user["id"], "")
+    rows = {
+        r["key"][len(prefix):]: r["value"]
+        for r in db.execute("SELECT key, value FROM settings WHERE key LIKE ?", (f"{prefix}%",)).fetchall()
+    }
     db.close()
     return rows
 
@@ -687,21 +707,21 @@ def save_settings(b: dict, user=Depends(_get_user)):
     for k, v in b.items():
         db.execute(
             "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
-            (k, str(v) if v is not None else None, now)
+            (_setting_key(user["id"], k), str(v) if v is not None else None, now)
         )
     db.commit(); db.close()
     return {"ok": True}
 
 @app.get("/api/db/stats")
 def db_stats(user=Depends(_get_user)):
-    import os
     db  = get_db()
+    db_path = os.path.abspath(DB_PATH)
     stats = {
-        "connections": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
-        "operations":  db.execute("SELECT COUNT(*) FROM operations").fetchone()[0],
-        "saved_queries": db.execute("SELECT COUNT(*) FROM saved_queries").fetchone()[0],
-        "db_path":     os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "ikonet.db")),
-        "db_size_kb":  round(os.path.getsize(os.path.join(os.path.dirname(__file__), "data", "ikonet.db")) / 1024, 1),
+        "connections": db.execute("SELECT COUNT(*) FROM connections WHERE user_id=?", (user["id"],)).fetchone()[0],
+        "operations":  db.execute("SELECT COUNT(*) FROM operations WHERE user_id=?", (user["id"],)).fetchone()[0],
+        "saved_queries": db.execute("SELECT COUNT(*) FROM saved_queries WHERE user_id=?", (user["id"],)).fetchone()[0],
+        "db_path":     db_path,
+        "db_size_kb":  round(os.path.getsize(db_path) / 1024, 1) if os.path.exists(db_path) else 0,
     }
     db.close()
     return stats

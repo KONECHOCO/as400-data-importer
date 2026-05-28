@@ -39,6 +39,14 @@ function ProtectedRoute({ children }) {
   return <Layout>{children}</Layout>
 }
 
+function AdminRoute({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return <Splash />
+  if (!user) return <Navigate to="/login" replace />
+  if (!user.is_admin) return <Navigate to="/dashboard" replace />
+  return <Layout>{children}</Layout>
+}
+
 // ── App con controllo licenza ─────────────────────────────────────────────────
 function AppShell() {
   const { user, loading } = useAuth()
@@ -90,7 +98,7 @@ function AppShell() {
       <Route path="/history"       element={<ProtectedRoute><History /></ProtectedRoute>} />
       <Route path="/plans"         element={user ? <ProtectedRoute><Plans /></ProtectedRoute> : <Plans />} />
       <Route path="/settings"      element={<ProtectedRoute><Settings /></ProtectedRoute>} />
-      <Route path="/admin/licenses" element={<ProtectedRoute><AdminLicenses /></ProtectedRoute>} />
+      <Route path="/admin/licenses" element={<AdminRoute><AdminLicenses /></AdminRoute>} />
       <Route path="/"              element={user ? <Navigate to="/dashboard" replace /> : <Landing />} />
       <Route path="*"              element={<Navigate to="/dashboard" replace />} />
     </Routes>

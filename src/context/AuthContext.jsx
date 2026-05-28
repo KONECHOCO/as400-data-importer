@@ -22,7 +22,7 @@ async function loadPersistedToken() {
         localStorage.setItem('token', res.token) // sync localStorage
         return res.token
       }
-    } catch (_) {}
+    } catch {}
   }
   return localStorage.getItem('token')
 }
