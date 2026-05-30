@@ -1,8 +1,11 @@
-import uuid, hashlib, platform, json
+import os, uuid, hashlib, platform, json
 from datetime import datetime, timedelta
 import requests
 
-VERIFY_URL = "https://as400.ikonetsolutions.com/api/license/verify"
+VERIFY_URL = os.environ.get(
+    "AS400_LICENSE_VERIFY_URL",
+    "https://as400pro.ikonetsolutions.com/api/license/verify",
+)
 CACHE_DAYS = 7
 
 def get_hardware_id() -> str:

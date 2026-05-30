@@ -1,7 +1,7 @@
-# AS400 Data Importer
+# AS400 Data Importer Pro
 
 <p align="center">
-  <img src="https://ikonetsolutions.com/logo.png" alt="Ikonet Solutions" width="80"/>
+  <img src="https://as400pro.ikonetsolutions.com/logo.png" alt="Ikonet Solutions" width="80"/>
 </p>
 
 <p align="center">
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://ikonetsolutions.com"><img src="https://img.shields.io/badge/website-ikonetsolutions.com-blue" alt="Website"/></a>
+  <a href="https://as400pro.ikonetsolutions.com"><img src="https://img.shields.io/badge/website-as400pro.ikonetsolutions.com-blue" alt="Website"/></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey" alt="Platform"/>
   <img src="https://img.shields.io/badge/python-3.11%2B-yellow" alt="Python"/>
   <img src="https://img.shields.io/badge/react-19-61dafb" alt="React"/>
@@ -49,7 +49,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/KONECHOCO/as400-data-importer.git
+git clone -b codex/pro-version https://github.com/KONECHOCO/as400-data-importer.git
 cd as400-data-importer
 
 # Install frontend dependencies
@@ -109,8 +109,8 @@ as400-data-importer/
 
 ## 📄 License
 
-MIT License — Copyright © 2025 [Ikonet Solutions](https://ikonetsolutions.com)
+MIT License — Copyright © 2026 [Ikonet Solutions](https://as400pro.ikonetsolutions.com)
 
 ---
 
-<p align="center">Made with ❤️ by <a href="https://ikonetsolutions.com">Ikonet Solutions</a></p>
+<p align="center">Made with ❤️ by <a href="https://as400pro.ikonetsolutions.com">Ikonet Solutions</a></p>

@@ -1,5 +1,5 @@
 ; ============================================================
-;  AS400 Data Importer — NSIS Installer
+;  AS400 Data Importer Pro — NSIS Installer
 ;  Ikonet Solutions
 ; ============================================================
 
@@ -12,32 +12,32 @@ Unicode True
 !include "x64.nsh"
 
 ; ── Defines ─────────────────────────────────────────────────
-!define APP_NAME        "AS400 Data Importer"
-!define APP_EXE         "AS400Importer.exe"
+!define APP_NAME        "AS400 Data Importer Pro"
+!define APP_EXE         "AS400ImporterPro.exe"
 !define APP_PUBLISHER   "Ikonet Solutions"
-!define APP_VERSION     "1.0.0"
-!define APP_URL         "https://ikonetsolutions.com"
-!define REG_UNINSTALL   "Software\Microsoft\Windows\CurrentVersion\Uninstall\AS400Importer"
+!define APP_VERSION     "2.0.0"
+!define APP_URL         "https://as400pro.ikonetsolutions.com"
+!define REG_UNINSTALL   "Software\Microsoft\Windows\CurrentVersion\Uninstall\AS400ImporterPro"
 !define REG_AUTORUN     "Software\Microsoft\Windows\CurrentVersion\Run"
 
 ; ── Installer properties ────────────────────────────────────
 Name            "${APP_NAME} ${APP_VERSION}"
-OutFile         "AS400Importer-Setup.exe"
-InstallDir      "$PROGRAMFILES64\AS400Importer"
+OutFile         "AS400ImporterPro-Setup.exe"
+InstallDir      "$PROGRAMFILES64\AS400ImporterPro"
 InstallDirRegKey HKLM "${REG_UNINSTALL}" "InstallLocation"
 RequestExecutionLevel admin
 BrandingText    "${APP_PUBLISHER}"
 ShowInstDetails show
 
 ; ── MUI Pages ───────────────────────────────────────────────
-!define MUI_ICON                    "AS400Importer.ico"
-!define MUI_UNICON                  "AS400Importer.ico"
+!define MUI_ICON                    "AS400ImporterPro.ico"
+!define MUI_UNICON                  "AS400ImporterPro.ico"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE       "Benvenuto in ${APP_NAME}"
 !define MUI_WELCOMEPAGE_TEXT        "Questo wizard installerà ${APP_NAME} ${APP_VERSION} sul tuo computer.$\r$\n$\r$\nL'applicazione consente di importare ed esportare dati dall'AS400 direttamente dalla tua rete aziendale.$\r$\n$\r$\nClicca Avanti per continuare."
 !define MUI_FINISHPAGE_RUN          "$INSTDIR\${APP_EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT     "Avvia ${APP_NAME} ora"
-!define MUI_FINISHPAGE_LINK         "Visita ikonetsolutions.com"
+!define MUI_FINISHPAGE_LINK         "Visita as400pro.ikonetsolutions.com"
 !define MUI_FINISHPAGE_LINK_LOCATION "${APP_URL}"
 
 !insertmacro MUI_PAGE_WELCOME
@@ -78,7 +78,7 @@ Section "Principale" SEC_MAIN
     SetOutPath "$INSTDIR"
 
     ; Copy all files from PyInstaller output
-    File /r "..\dist_windows_new\AS400Importer\*"
+    File /r "..\dist_windows_new\AS400ImporterPro\*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -120,13 +120,13 @@ SectionEnd
 
 ; ── Optional: autostart with Windows ───────────────────────
 Section /o "Avvia automaticamente con Windows" SEC_AUTOSTART
-    WriteRegStr HKCU "${REG_AUTORUN}" "AS400Importer" '"$INSTDIR\${APP_EXE}"'
+    WriteRegStr HKCU "${REG_AUTORUN}" "AS400ImporterPro" '"$INSTDIR\${APP_EXE}"'
 SectionEnd
 
 ; ── Section descriptions ────────────────────────────────────
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_MAIN}      "File principali dell'applicazione (obbligatorio)."
-    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_AUTOSTART} "Avvia AS400 Data Importer automaticamente all'avvio di Windows."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_AUTOSTART} "Avvia AS400 Data Importer Pro automaticamente all'avvio di Windows."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ── Uninstaller ─────────────────────────────────────────────
@@ -144,14 +144,14 @@ Section "Uninstall"
 
     ; Remove registry keys
     DeleteRegKey HKLM "${REG_UNINSTALL}"
-    DeleteRegValue HKCU "${REG_AUTORUN}" "AS400Importer"
+    DeleteRegValue HKCU "${REG_AUTORUN}" "AS400ImporterPro"
 
     ; Ask about user data
     MessageBox MB_YESNO|MB_ICONQUESTION \
         "Vuoi eliminare anche il database e i dati dell'applicazione?$\r$\n$\r$\n\
         (Connessioni, operazioni, query salvate ecc.)" \
         IDNO skip_data
-        RMDir /r "$LOCALAPPDATA\AS400Importer"
+        RMDir /r "$LOCALAPPDATA\AS400ImporterPro"
     skip_data:
 
     SetAutoClose true

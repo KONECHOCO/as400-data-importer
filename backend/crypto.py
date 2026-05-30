@@ -4,7 +4,7 @@ from cryptography.fernet import Fernet
 def _key() -> bytes:
     # Chiave derivata dall'ID hardware — univoca per macchina
     hw = str(uuid.getnode())
-    digest = hashlib.sha256(f"ikonet-as400-{hw}".encode()).digest()
+    digest = hashlib.sha256(f"ikonet-as400-pro-{hw}".encode()).digest()
     return base64.urlsafe_b64encode(digest)
 
 def encrypt(text: str) -> str:

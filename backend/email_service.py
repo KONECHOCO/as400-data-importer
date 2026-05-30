@@ -18,12 +18,14 @@ except ImportError:
 
 # ── Configurazione ────────────────────────────────────────────────────────────
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
-FROM_EMAIL = "noreply@ikonetsolutions.com"
-FROM_NAME  = "AS400 Data Importer"
+FROM_EMAIL = os.environ.get("APP_FROM_EMAIL", "noreply@as400pro.ikonetsolutions.com")
+FROM_NAME = os.environ.get("APP_FROM_NAME", "AS400 Data Importer Pro")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
+PUBLIC_SITE_URL = os.environ.get("APP_PUBLIC_SITE_URL", "https://as400pro.ikonetsolutions.com")
+SUPPORT_EMAIL = os.environ.get("APP_SUPPORT_EMAIL", "supporto@as400pro.ikonetsolutions.com")
 
 SENDGRID_URL = "https://api.sendgrid.com/v3/mail/send"
-DOWNLOAD_URL = "https://ikonetsolutions.com/AS400Importer-Setup.exe"
+DOWNLOAD_URL = os.environ.get("APP_DOWNLOAD_URL", f"{PUBLIC_SITE_URL}/AS400ImporterPro-Setup.exe")
 
 
 # ── Helper interno ────────────────────────────────────────────────────────────
@@ -115,8 +117,8 @@ def _wrap(content: str) -> str:
           <td style="padding:20px 36px;border-top:1px solid #1e293b;
                      font-size:11px;color:#475569;text-align:center">
             © {datetime.utcnow().year} Ikonet Solutions ·
-            <a href="https://as400.ikonetsolutions.com" style="color:#3b82f6;text-decoration:none">
-              as400.ikonetsolutions.com</a>
+            <a href="{PUBLIC_SITE_URL}" style="color:#3b82f6;text-decoration:none">
+              as400pro.ikonetsolutions.com</a>
           </td>
         </tr>
       </table>
@@ -141,7 +143,7 @@ def send_trial_license(to_email: str, name: str, license_key: str,
     """Inviata dall'admin quando crea una nuova licenza per un cliente."""
     plan_label = plan.upper() if plan else "TRIAL"
     html = _wrap(f"""
-      <h2 style="margin:0 0 8px;color:#fff;font-size:22px">La tua licenza AS400 Data Importer</h2>
+      <h2 style="margin:0 0 8px;color:#fff;font-size:22px">La tua licenza AS400 Data Importer Pro</h2>
       <p style="color:#94a3b8;margin:0 0 20px">
         Ciao <strong style="color:#e2e8f0">{name or to_email}</strong>
         {'di <strong style="color:#e2e8f0">' + company + '</strong>' if company else ''}!
@@ -170,7 +172,7 @@ def send_trial_license(to_email: str, name: str, license_key: str,
                        margin-right:8px">1</span>
           Scarica e installa l'applicazione
         </p>
-        {_btn("⬇️ Scarica AS400 Data Importer (.exe)", DOWNLOAD_URL, "#2563eb")}
+        {_btn("⬇️ Scarica AS400 Data Importer Pro (.exe)", DOWNLOAD_URL, "#2563eb")}
       </div>
 
       <!-- Step 2: Attiva -->
@@ -189,12 +191,12 @@ def send_trial_license(to_email: str, name: str, license_key: str,
 
       <p style="color:#64748b;font-size:12px;margin:0;text-align:center">
         Problemi con l'attivazione? Scrivi a
-        <a href="mailto:supporto@ikonetsolutions.com" style="color:#3b82f6">
-          supporto@ikonetsolutions.com</a>
+        <a href="mailto:{SUPPORT_EMAIL}" style="color:#3b82f6">
+          {SUPPORT_EMAIL}</a>
       </p>
     """)
     _async(_send, to_email, name or to_email,
-           f"La tua licenza AS400 Data Importer — {plan_label}", html)
+           f"La tua licenza AS400 Data Importer Pro — {plan_label}", html)
 
 
 # ── Email 1: Benvenuto ────────────────────────────────────────────────────────
@@ -203,7 +205,7 @@ def send_welcome(to_email: str, name: str, company: str):
       <h2 style="margin:0 0 8px;color:#fff;font-size:22px">Benvenuto, {name}! 👋</h2>
       <p style="color:#94a3b8;margin:0 0 20px">
         Il tuo account <strong style="color:#e2e8f0">{company}</strong>
-        è attivo su <strong style="color:#e2e8f0">AS400 Data Importer</strong>.
+        è attivo su <strong style="color:#e2e8f0">AS400 Data Importer Pro</strong>.
         Segui i 2 passi qui sotto per iniziare subito.
       </p>
 
@@ -219,7 +221,7 @@ def send_welcome(to_email: str, name: str, company: str):
           Clicca il pulsante per scaricare il programma per Windows (80 MB).
           Dopo l'installazione avvialo dal desktop.
         </p>
-        {_btn("⬇️ Scarica AS400 Data Importer (.exe)", DOWNLOAD_URL, "#2563eb")}
+        {_btn("⬇️ Scarica AS400 Data Importer Pro (.exe)", DOWNLOAD_URL, "#2563eb")}
         <p style="margin:0;color:#475569;font-size:11px;text-align:center">
           Windows 10/11 — 64 bit · Richiede Java (JRE 8+)
         </p>
@@ -257,12 +259,12 @@ def send_welcome(to_email: str, name: str, company: str):
 
       <p style="color:#64748b;font-size:12px;margin:20px 0 0;text-align:center">
         Hai problemi con il download o l'installazione? Scrivi a
-        <a href="mailto:supporto@ikonetsolutions.com" style="color:#3b82f6">
-          supporto@ikonetsolutions.com</a>
+        <a href="mailto:{SUPPORT_EMAIL}" style="color:#3b82f6">
+          {SUPPORT_EMAIL}</a>
       </p>
     """)
     _async(_send, to_email, name,
-           "Benvenuto su AS400 Data Importer — Scarica l'app e inizia subito ✓", html)
+           "Benvenuto su AS400 Data Importer Pro — Scarica l'app e inizia subito ✓", html)
 
 
 # ── Email 2: Import completato ────────────────────────────────────────────────
@@ -388,7 +390,7 @@ def send_license_expiry_warning(to_email: str, name: str,
     html = _wrap(f"""
       <h2 style="margin:0 0 6px;color:#fff">{urgency} — Licenza in scadenza</h2>
       <p style="color:#94a3b8;margin:0 0 24px;font-size:14px">
-        La tua licenza AS400 Data Importer scade tra
+        La tua licenza AS400 Data Importer Pro scade tra
         <strong style="color:{badge_color}"> {days_left} giorni</strong>.
         Rinnova adesso per non interrompere il servizio.
       </p>
@@ -415,7 +417,7 @@ def send_license_expiry_warning(to_email: str, name: str,
         </table>
       </div>
 
-      {_btn("Rinnova la licenza →", "https://as400.ikonetsolutions.com", badge_color)}
+      {_btn("Rinnova la licenza →", PUBLIC_SITE_URL, badge_color)}
 
       <p style="color:#64748b;font-size:12px;margin:16px 0 0;text-align:center">
         Hai già rinnovato? Inserisci la nuova chiave in
@@ -455,4 +457,4 @@ def send_password_reset(to_email: str, name: str, reset_token: str):
       </p>
     """)
     # Reset password è sincrono — vogliamo sapere subito se fallisce
-    return _send(to_email, name, "Reimposta la tua password — AS400 Data Importer", html)
+    return _send(to_email, name, "Reimposta la tua password — AS400 Data Importer Pro", html)

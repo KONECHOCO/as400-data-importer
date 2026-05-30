@@ -52,7 +52,7 @@ def _jt400_jar_path() -> str:
 
 pwd_ctx  = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
-app = FastAPI(title="Ikonet AS400 Local Agent")
+app = FastAPI(title="Ikonet AS400 Pro Local Agent")
 _cors_origins = [
     origin.strip()
     for origin in os.environ.get("AS400_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
@@ -746,7 +746,7 @@ def subscription(user=Depends(_get_user)):
 # ── Download setup installer ──────────────────────────────────────────────────
 _DOWNLOADS_DIR = os.environ.get("AS400_SETUP_DIR",
                                 "/opt/as400-frontend/downloads")
-_SETUP_FILENAME = "AS400Importer-Setup.exe"
+_SETUP_FILENAME = os.environ.get("AS400_SETUP_FILENAME", "AS400ImporterPro-Setup.exe")
 
 @app.get("/download/info")
 def download_info():

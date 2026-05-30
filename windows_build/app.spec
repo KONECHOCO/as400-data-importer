@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec — AS400 Data Importer
+PyInstaller spec — AS400 Data Importer Pro
 Run from the project root:
     pyinstaller windows_build\\app.spec
 """
@@ -11,9 +11,10 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_dat
 block_cipher = None
 
 # SPECPATH = directory contenente questo file spec (es. .../windows_build)
-# PROJECT_ROOT = directory padre (es. .../AS400Importer-WindowsBuild)
+# PROJECT_ROOT = directory padre (es. .../AS400ImporterPro-WindowsBuild)
 SPEC_DIR     = os.path.abspath(SPECPATH)        # .../windows_build
-PROJECT_ROOT = os.path.dirname(SPEC_DIR)        # .../AS400Importer-WindowsBuild
+PROJECT_ROOT = os.path.dirname(SPEC_DIR)        # .../AS400ImporterPro-WindowsBuild
+ICON_PATH = os.path.join(SPEC_DIR, 'AS400ImporterPro.ico')
 
 # ── Collect hidden imports + datas for tricky packages ───────────────────────
 datas         = []
@@ -129,13 +130,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='AS400Importer',
+    name='AS400ImporterPro',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     console=False,           # no console window — uses system tray
-    icon=os.path.join(SPEC_DIR, 'AS400Importer.ico'),
+    icon=ICON_PATH if os.path.exists(ICON_PATH) else None,
     version=os.path.join(SPEC_DIR, 'version_info.txt'),
 )
 
@@ -147,5 +148,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='AS400Importer',    # output folder: dist_windows/AS400Importer/
+    name='AS400ImporterPro',    # output folder: dist_windows/AS400ImporterPro/
 )

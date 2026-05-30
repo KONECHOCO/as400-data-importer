@@ -173,7 +173,7 @@ export default function Landing() {
 
       {/* ── Footer ── */}
       <footer className="border-t border-slate-800 py-6 text-center text-slate-600 text-xs">
-        © 2026 Ikonet Solutions · AS400 Data Importer
+        © 2026 Ikonet Solutions · AS400 Data Importer Pro
       </footer>
     </div>
   )

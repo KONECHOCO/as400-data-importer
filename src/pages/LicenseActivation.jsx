@@ -82,7 +82,7 @@ export default function LicenseActivation({ trialExpired, onActivated }) {
 
           {/* Banner trial gratuito */}
           <a
-            href="https://as400.ikonetsolutions.com/register"
+            href="https://as400pro.ikonetsolutions.com/register"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-3 bg-blue-500/10 border border-blue-500/20 rounded-xl p-4 hover:bg-blue-500/15 transition-colors group"
@@ -165,14 +165,14 @@ export default function LicenseActivation({ trialExpired, onActivated }) {
 
         <div className="mt-5 text-center space-y-2">
           <a
-            href="https://as400.ikonetsolutions.com/plans"
+            href="https://as400pro.ikonetsolutions.com/plans"
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-400 hover:text-blue-300 text-sm transition-colors block"
           >
-            Acquista una licenza su as400.ikonetsolutions.com →
+            Acquista una licenza su as400pro.ikonetsolutions.com →
           </a>
-          <p className="text-slate-600 text-xs">Supporto: supporto@ikonetsolutions.com</p>
+          <p className="text-slate-600 text-xs">Supporto: supporto@as400pro.ikonetsolutions.com</p>
         </div>
 
         <p className="text-center text-slate-700 text-xs mt-4">

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.0 Pro - 2026-05-30
+
+- Created the AS400 Data Importer Pro variant with its own app name, package name, installer name, and Windows app directory.
+- Switched public product links and license verification defaults to `as400pro.ikonetsolutions.com`.
+- Separated the Pro local database and credential encryption namespace from the standard edition.
+- Made Pro email sender, public site, support email, download URL, and setup filename configurable by environment variables.
+
 ## 1.0.4 - 2026-05-30
 
 - Improved dashboard responsiveness for narrow windows.

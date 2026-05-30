@@ -63,7 +63,7 @@ export default function LoginPage() {
               <div className="text-blue-400 text-xs tracking-widest">SOLUTIONS</div>
             </div>
           </div>
-          <h1 className="text-2xl font-bold text-white">AS400 Data Importer</h1>
+          <h1 className="text-2xl font-bold text-white">AS400 Data Importer Pro</h1>
           <p className="text-slate-400 text-sm mt-1">
             {mode === 'login' ? 'Accedi al tuo account' : mode === 'register' ? '14 giorni di prova gratuita' : 'Recupero password'}
           </p>

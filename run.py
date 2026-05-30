@@ -1,6 +1,6 @@
 """
-AS400 Data Importer — Windows entry point.
-Bundled by PyInstaller into AS400Importer.exe.
+AS400 Data Importer Pro — Windows entry point.
+Bundled by PyInstaller into AS400ImporterPro.exe.
 """
 import sys
 import os
@@ -23,7 +23,7 @@ else:
 # ── Writable data dir ─────────────────────────────────────────────────────────
 APP_DIR  = os.path.join(
     os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
-    'AS400Importer'
+    'AS400ImporterPro'
 )
 DATA_DIR = os.path.join(APP_DIR, 'data')
 LOG_FILE = os.path.join(APP_DIR, 'error.log')
@@ -36,7 +36,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
 # Env vars per il backend
-os.environ['AS400_DB_PATH']   = os.path.join(DATA_DIR, 'ikonet.db')
+os.environ['AS400_DB_PATH']   = os.path.join(DATA_DIR, 'ikonet_pro.db')
 os.environ['AS400_JT400_JAR'] = os.path.join(BUNDLE_DIR, 'lib', 'jt400.jar')
 os.environ['AS400_DIST_DIR']  = os.path.join(BUNDLE_DIR, 'dist')
 
@@ -300,9 +300,9 @@ def _start_tray(window_ref: list):
             os._exit(0)
 
         icon = pystray.Icon(
-            'AS400Importer',
+            'AS400ImporterPro',
             _make_icon(),
-            'AS400 Data Importer',
+            'AS400 Data Importer Pro',
             menu=pystray.Menu(
                 pystray.MenuItem('Apri', _on_show, default=True),
                 pystray.MenuItem('Esci', _on_quit),
@@ -324,7 +324,7 @@ if __name__ == '__main__':
         try:
             import webview
             w = webview.create_window(
-                'AS400 Data Importer', URL,
+                'AS400 Data Importer Pro', URL,
                 width=1280, height=800, min_size=(900, 600)
             )
             webview.start()
@@ -348,7 +348,7 @@ if __name__ == '__main__':
         api = AppApi()
         window_ref = [None]
         window_ref[0] = webview.create_window(
-            'AS400 Data Importer — Ikonet Solutions',
+            'AS400 Data Importer Pro — Ikonet Solutions',
             URL,
             width=1280,
             height=800,

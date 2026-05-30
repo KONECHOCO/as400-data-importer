@@ -166,7 +166,7 @@ export default function Plans() {
           Il pagamento avviene via PayPal in totale sicurezza.
         </p>
         <a
-          href="https://as400.ikonetsolutions.com/plans"
+          href="https://as400pro.ikonetsolutions.com/plans"
           target="_blank"
           rel="noopener noreferrer"
           className="inline-block bg-blue-500 hover:bg-blue-600 text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition-colors"

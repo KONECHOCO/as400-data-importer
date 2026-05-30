@@ -1,7 +1,7 @@
 import sqlite3, os
 
-# In Windows frozen mode, AS400_DB_PATH points to %LOCALAPPDATA%\AS400Importer\data\ikonet.db
-DB_PATH = os.environ.get('AS400_DB_PATH') or os.path.join(os.path.dirname(__file__), "data", "ikonet.db")
+# In Windows frozen mode, AS400_DB_PATH points to %LOCALAPPDATA%\AS400ImporterPro\data\ikonet_pro.db
+DB_PATH = os.environ.get('AS400_DB_PATH') or os.path.join(os.path.dirname(__file__), "data", "ikonet_pro.db")
 
 def get_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
