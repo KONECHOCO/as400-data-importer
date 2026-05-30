@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.4 - 2026-05-30
+
+- Improved dashboard responsiveness for narrow windows.
+- Changed the sidebar to an icon rail on small viewports so dashboard cards no longer overlap.
+
 ## 1.0.3 - 2026-05-28
 
 - Added ESLint configuration and cleaned the frontend so lint passes.

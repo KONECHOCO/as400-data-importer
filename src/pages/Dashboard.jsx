@@ -41,7 +41,7 @@ export default function Dashboard() {
   return (
     <div className="space-y-6">
       {/* Welcome */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-bold text-white">Ciao, {user?.name?.split(' ')[0]}! 👋</h2>
           <p className="text-slate-400 text-sm mt-1">{user?.company} — {new Date().toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
@@ -54,15 +54,15 @@ export default function Dashboard() {
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-4">
         {cards.map(card => (
-          <Link key={card.label} to={card.link} className="block">
-            <div className={`bg-[#151824] border ${colorMap[card.color]} rounded-2xl p-5 hover:scale-105 transition-transform`}>
-              <div className={`text-2xl mb-3 w-10 h-10 rounded-xl flex items-center justify-center ${colorMap[card.color]}`}>
+          <Link key={card.label} to={card.link} className="block min-w-0">
+            <div className={`h-full bg-[#151824] border ${colorMap[card.color]} rounded-2xl p-5 hover:border-opacity-80 transition-colors`}>
+              <div className={`text-xl mb-3 w-10 h-10 rounded-xl flex items-center justify-center ${colorMap[card.color]}`}>
                 {card.icon}
               </div>
-              <div className="text-2xl font-bold text-white">{loading ? '...' : card.value}</div>
-              <div className="text-slate-400 text-xs mt-1">{card.label}</div>
+              <div className="text-2xl font-bold text-white truncate">{loading ? '...' : card.value}</div>
+              <div className="text-slate-400 text-xs mt-1 leading-snug break-words">{card.label}</div>
             </div>
           </Link>
         ))}
