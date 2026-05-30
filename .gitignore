@@ -38,6 +38,7 @@ Thumbs.db
 
 # NSIS output
 windows_build/AS400Importer-Setup.exe
+windows_build/AS400ImporterPro-Setup.exe
 
 # Certificates / secrets
 *.pfx

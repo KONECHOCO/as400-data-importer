@@ -101,6 +101,23 @@ def init_db():
         expires_at TEXT NOT NULL,
         used       INTEGER DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS issued_licenses (
+        license_key         TEXT PRIMARY KEY,
+        email               TEXT NOT NULL,
+        user_name           TEXT,
+        company             TEXT,
+        plan                TEXT NOT NULL,
+        expires_at          TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        revoked             INTEGER DEFAULT 0,
+        hardware_id         TEXT,
+        hostname            TEXT,
+        activated_at        TEXT,
+        last_verified_at    TEXT,
+        suspicious_attempts INTEGER DEFAULT 0,
+        notes               TEXT
+    );
     """)
     db.commit()
 

@@ -16,6 +16,7 @@ from .database     import DB_PATH, init_db, get_db
 from .crypto       import encrypt, decrypt
 from .license_mgr  import get_status, activate as lic_activate, get_hardware_id
 from .email_service import (
+    send_trial_license,
     send_welcome,
     send_import_done,
     send_export_done,
@@ -82,6 +83,11 @@ def _get_user(authorization: str = Header(None)):
     if not row:
         raise HTTPException(401, "Utente non trovato")
     return dict(row)
+
+def _require_admin(user=Depends(_get_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Accesso admin richiesto")
+    return user
 
 def _pub(u: dict) -> dict:
     public = {k: v for k, v in u.items() if k != "password_hash"}
@@ -231,6 +237,167 @@ def license_activate(b: dict):
         db.close()
         raise HTTPException(400, str(e))
 
+@app.post("/api/license/verify")
+def license_verify(b: dict):
+    license_key = (b.get("license_key") or "").strip().upper()
+    hardware_id = (b.get("hardware_id") or "").strip().upper()
+    hostname = (b.get("hostname") or "").strip()
+    if not license_key or not hardware_id:
+        raise HTTPException(400, "license_key e hardware_id sono obbligatori")
+
+    db = get_db()
+    row = db.execute("SELECT * FROM issued_licenses WHERE license_key=?", (license_key,)).fetchone()
+    if not row:
+        db.close()
+        return {"valid": False, "message": "Licenza non trovata"}
+    lic = dict(row)
+    if lic.get("revoked"):
+        db.close()
+        return {"valid": False, "message": "Licenza revocata"}
+    if datetime.fromisoformat(lic["expires_at"]) < datetime.utcnow():
+        db.close()
+        return {"valid": False, "message": "Licenza scaduta", "expires_at": lic["expires_at"]}
+
+    now = datetime.utcnow().isoformat()
+    if lic.get("hardware_id") and lic["hardware_id"] != hardware_id:
+        db.execute(
+            "UPDATE issued_licenses SET suspicious_attempts=COALESCE(suspicious_attempts,0)+1, last_verified_at=? WHERE license_key=?",
+            (now, license_key),
+        )
+        db.commit()
+        db.close()
+        return {"valid": False, "message": "Licenza gia attivata su un altro dispositivo"}
+
+    if not lic.get("hardware_id"):
+        db.execute(
+            "UPDATE issued_licenses SET hardware_id=?, hostname=?, activated_at=?, last_verified_at=? WHERE license_key=?",
+            (hardware_id, hostname, now, now, license_key),
+        )
+    else:
+        db.execute(
+            "UPDATE issued_licenses SET hostname=?, last_verified_at=? WHERE license_key=?",
+            (hostname, now, license_key),
+        )
+    db.commit()
+    row = db.execute("SELECT * FROM issued_licenses WHERE license_key=?", (license_key,)).fetchone()
+    db.close()
+    lic = dict(row)
+    return {
+        "valid": True,
+        "license_key": lic["license_key"],
+        "plan": lic["plan"],
+        "expires_at": lic["expires_at"],
+        "user_name": lic.get("user_name"),
+        "company": lic.get("company"),
+        "email": lic.get("email"),
+        "hardware_id": hardware_id,
+    }
+
+class IssueLicenseBody(BaseModel):
+    email: str
+    user_name: str = ""
+    company: str = ""
+    plan: str = "starter"
+    expires_days: int = 365
+    notes: str = ""
+
+class ExtendLicenseBody(BaseModel):
+    days: int
+
+def _license_key(plan: str) -> str:
+    prefix_map = {
+        "trial": "TRIA",
+        "starter": "STRT",
+        "business": "BUSN",
+        "pro": "PROF",
+        "enterprise": "ENTP",
+    }
+    prefix = prefix_map.get((plan or "").lower(), "PROF")
+    parts = [uuid.uuid4().hex[:4].upper() for _ in range(3)]
+    return "-".join([prefix, *parts])
+
+@app.get("/api/admin/licenses")
+def admin_list_licenses(_admin=Depends(_require_admin)):
+    db = get_db()
+    rows = db.execute("SELECT * FROM issued_licenses ORDER BY created_at DESC").fetchall()
+    db.close()
+    return [{**dict(row), "_id": dict(row)["license_key"]} for row in rows]
+
+@app.post("/api/admin/issued-licenses")
+def admin_issue_license(b: IssueLicenseBody, _admin=Depends(_require_admin)):
+    if not b.email or "@" not in b.email:
+        raise HTTPException(400, "Email non valida")
+    if b.expires_days < 1:
+        raise HTTPException(400, "La durata deve essere almeno 1 giorno")
+    db = get_db()
+    key = _license_key(b.plan)
+    while db.execute("SELECT 1 FROM issued_licenses WHERE license_key=?", (key,)).fetchone():
+        key = _license_key(b.plan)
+    now = datetime.utcnow()
+    expires_at = (now + timedelta(days=b.expires_days)).isoformat()
+    db.execute(
+        """
+        INSERT INTO issued_licenses
+            (license_key, email, user_name, company, plan, expires_at, created_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            key,
+            b.email.lower().strip(),
+            b.user_name.strip(),
+            b.company.strip(),
+            b.plan,
+            expires_at,
+            now.isoformat(),
+            b.notes.strip(),
+        ),
+    )
+    db.commit()
+    db.close()
+    send_trial_license(b.email.lower().strip(), b.user_name or b.email, key, b.plan, b.expires_days, b.company)
+    return {"license_key": key, "expires_at": expires_at}
+
+@app.post("/api/admin/licenses/{license_key}/revoke")
+def admin_revoke_license(license_key: str, _admin=Depends(_require_admin)):
+    db = get_db()
+    cur = db.execute("UPDATE issued_licenses SET revoked=1 WHERE license_key=?", (license_key.upper(),))
+    db.commit()
+    db.close()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Licenza non trovata")
+    return {"ok": True}
+
+@app.post("/api/admin/licenses/{license_key}/reset-hardware")
+def admin_reset_license_hardware(license_key: str, _admin=Depends(_require_admin)):
+    db = get_db()
+    cur = db.execute(
+        "UPDATE issued_licenses SET hardware_id=NULL, hostname=NULL, activated_at=NULL WHERE license_key=?",
+        (license_key.upper(),),
+    )
+    db.commit()
+    db.close()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Licenza non trovata")
+    return {"ok": True}
+
+@app.post("/api/admin/licenses/{license_key}/extend")
+def admin_extend_license(license_key: str, b: ExtendLicenseBody, _admin=Depends(_require_admin)):
+    if b.days < 1:
+        raise HTTPException(400, "Giorni non validi")
+    db = get_db()
+    row = db.execute("SELECT expires_at FROM issued_licenses WHERE license_key=?", (license_key.upper(),)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Licenza non trovata")
+    base = datetime.fromisoformat(row["expires_at"])
+    if base < datetime.utcnow():
+        base = datetime.utcnow()
+    expires_at = (base + timedelta(days=b.days)).isoformat()
+    db.execute("UPDATE issued_licenses SET expires_at=?, revoked=0 WHERE license_key=?", (expires_at, license_key.upper()))
+    db.commit()
+    db.close()
+    return {"ok": True, "expires_at": expires_at}
+
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 class SetupBody(BaseModel):
     email: str; password: str; name: str; company: str
@@ -255,13 +422,13 @@ def setup_account(b: SetupBody):
         raise HTTPException(400, "Account già configurato")
     uid = str(uuid.uuid4())
     db.execute(
-        "INSERT INTO users (id, email, password_hash, name, company, created_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO users (id, email, password_hash, name, company, created_at, is_admin) VALUES (?,?,?,?,?,?,1)",
         (uid, b.email, pwd_ctx.hash(b.password), b.name, b.company, datetime.utcnow().isoformat())
     )
     db.commit()
     db.close()
     send_welcome(b.email, b.name, b.company)
-    return {"token": _make_token(uid), "user": {"id": uid, "email": b.email, "name": b.name, "company": b.company}}
+    return {"token": _make_token(uid), "user": {"id": uid, "email": b.email, "name": b.name, "company": b.company, "is_admin": True}}
 
 @app.post("/api/auth/register")
 def register(b: SetupBody):

@@ -1,0 +1,17 @@
+fastapi==0.124.2
+uvicorn[standard]==0.38.0
+pydantic==2.12.5
+python-jose[cryptography]==3.5.0
+passlib==1.7.4
+cryptography==46.0.3
+requests==2.32.5
+python-multipart==0.0.20
+jaydebeapi==1.2.3
+JPype1==1.6.0
+pandas==2.3.3
+numpy==2.3.5
+openpyxl==3.1.5
+xlrd==2.0.2
+xlwt==1.3.0
+chardet==5.2.0
+reportlab==4.4.5
