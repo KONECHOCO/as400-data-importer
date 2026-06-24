@@ -30,3 +30,5 @@ as400_web_backend.zip
 .DS_Store
 Thumbs.db
 agent/lib/jt400.jar
+backend/venv/
+venv/

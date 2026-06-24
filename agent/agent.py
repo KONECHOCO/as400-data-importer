@@ -241,13 +241,22 @@ def _sync_import(req: ImportRequest) -> dict:
             placeholders = ", ".join(["?" for _ in columns])
             sql = f"INSERT INTO {req.library}.{req.table_name} ({cols_str}) VALUES ({placeholders})"
             for i in range(0, len(data_rows), 500):
-                for row in data_rows[i:i+500]:
+                batch = data_rows[i:i+500]
+                batch_vals = []
+                for row in batch:
                     vals = [None if (v is None or (isinstance(v, float) and v != v)) else v for v in row]
-                    try:
-                        cursor.execute(sql, vals)
-                        inserted += 1
-                    except Exception as row_err:
-                        errors.append(str(row_err))
+                    batch_vals.append(vals)
+                try:
+                    cursor.executemany(sql, batch_vals)
+                    inserted += len(batch)
+                except Exception as batch_err:
+                    log.warning(f"Batch insert fallito, fallback a riga singola: {batch_err}")
+                    for vals in batch_vals:
+                        try:
+                            cursor.execute(sql, vals)
+                            inserted += 1
+                        except Exception as row_err:
+                            errors.append(str(row_err))
                 conn.commit()
         cursor.close(); conn.close()
         if errors and inserted == 0:
@@ -257,6 +266,118 @@ def _sync_import(req: ImportRequest) -> dict:
         import traceback
         return {"success": False, "error": str(e), "detail": traceback.format_exc()}
 
+def get_ws_url() -> str:
+    key = LICENSE_KEY or config.get("license_key", "")
+    base = CLOUD_URL.replace("https://", "wss://").replace("http://", "ws://")
+    if base.endswith("/api"):
+        return f"{base}/ws/agent?license_key={key}"
+    elif base.endswith("/api/"):
+        return f"{base}ws/agent?license_key={key}"
+    else:
+        return f"{base}/api/ws/agent?license_key={key}"
+
+async def _ws_loop():
+    import asyncio
+    import websockets
+    import json
+    
+    while True:
+        key = LICENSE_KEY or config.get("license_key", "")
+        if not key:
+            log.warning("Nessuna chiave di licenza configurata. In attesa di attivazione...")
+            await asyncio.sleep(10)
+            continue
+            
+        ws_url = get_ws_url()
+        log.info(f"Connessione al canale WebSocket del Cloud: {ws_url.split('?')[0]}")
+        try:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+                log.info("Connessione WebSocket stabilita con il Cloud!")
+                while True:
+                    msg_str = await ws.recv()
+                    msg = json.loads(msg_str)
+                    action = msg.get("action")
+                    req_id = msg.get("request_id")
+                    req_data = msg.get("data", {})
+                    
+                    log.info(f"Ricevuto comando [{action}] - ID: {req_id}")
+                    asyncio.create_task(_handle_ws_command(ws, action, req_id, req_data))
+        except Exception as e:
+            log.warning(f"Errore WebSocket o disconnessione: {e}. Riconnessione tra 5 secondi...")
+            await asyncio.sleep(5)
+
+async def _handle_ws_command(ws, action: str, req_id: str, req_data: dict):
+    import json
+    import base64
+    import tempfile
+    
+    response = {"request_id": req_id, "success": False}
+    try:
+        if action == "test-connection":
+            host = req_data.get("host")
+            user = req_data.get("user")
+            password = req_data.get("password")
+            res = _test_as400_connection(host, user, password)
+            response.update(res)
+            
+        elif action == "query":
+            conn_data = req_data.get("connection", {})
+            conn_obj = AS400Connection(
+                host=conn_data.get("host"),
+                user=conn_data.get("user"),
+                password=conn_data.get("password"),
+                port=conn_data.get("port", 23)
+            )
+            sql = req_data.get("sql")
+            limit = req_data.get("limit", 1000)
+            res = _run_as400_query(conn_obj, sql, limit)
+            response.update(res)
+            
+        elif action == "import":
+            conn_data = req_data.get("connection", {})
+            conn_obj = AS400Connection(
+                host=conn_data.get("host"),
+                user=conn_data.get("user"),
+                password=conn_data.get("password"),
+                port=conn_data.get("port", 23)
+            )
+            file_content_b64 = req_data.get("file_content_b64")
+            file_ext = req_data.get("file_ext", "csv")
+            
+            # Scrivi il file temporaneo
+            file_bytes = base64.b64decode(file_content_b64)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+                
+            req = ImportRequest(
+                connection=conn_obj,
+                library=req_data.get("library"),
+                table_name=req_data.get("table_name"),
+                mode=req_data.get("mode"),
+                file_path=tmp_path,
+                field_config=req_data.get("field_config")
+            )
+            
+            res = _sync_import(req)
+            
+            try:
+                import os
+                os.unlink(tmp_path)
+            except:
+                pass
+                
+            response.update(res)
+        else:
+            response["error"] = f"Azione sconosciuta: {action}"
+    except Exception as e:
+        response["error"] = str(e)
+        
+    try:
+        await ws.send(json.dumps(response))
+    except Exception as e:
+        log.error(f"Impossibile inviare risposta al WebSocket: {e}")
+
 @app.on_event("startup")
 async def startup():
     import asyncio
@@ -264,6 +385,7 @@ async def startup():
     log.info(f"Hardware ID: {HARDWARE_ID}")
     await verify_license_with_cloud()
     asyncio.create_task(_license_loop())
+    asyncio.create_task(_ws_loop())
 
 async def _license_loop():
     import asyncio
@@ -273,3 +395,4 @@ async def _license_loop():
 
 if __name__ == "__main__":
     uvicorn.run("agent:app", host="0.0.0.0", port=AGENT_PORT, reload=False)
+

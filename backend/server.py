@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).parent
 
 # ── MONGODB ──────────────────────────────────────────────────
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
 client_db = AsyncIOMotorClient(mongo_url)
 db = client_db[os.environ.get('DB_NAME', 'as400importer')]
 
@@ -42,6 +42,109 @@ db = client_db[os.environ.get('DB_NAME', 'as400importer')]
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
+
+# ── ENCRYPTION KEY INITIALIZATION (AES-256) ──────────────────
+from cryptography.fernet import Fernet
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+if not ENCRYPTION_KEY:
+    env_path = ROOT_DIR / ".env"
+    if env_path.exists():
+        with open(env_path, "r") as f:
+            for line in f:
+                if line.startswith("ENCRYPTION_KEY="):
+                    ENCRYPTION_KEY = line.split("=", 1)[1].strip()
+                    break
+    if not ENCRYPTION_KEY:
+        ENCRYPTION_KEY = Fernet.generate_key().decode()
+        try:
+            mode = "a" if env_path.exists() else "w"
+            with open(env_path, mode) as f:
+                f.write(f"\nENCRYPTION_KEY={ENCRYPTION_KEY}\n")
+            logger.info("Generata nuova ENCRYPTION_KEY e salvata in .env")
+        except Exception as e:
+            logger.warning(f"Impossibile salvare ENCRYPTION_KEY in .env: {e}")
+
+def encrypt_password(password: str) -> str:
+    if not password:
+        return ""
+    f = Fernet(ENCRYPTION_KEY.encode())
+    return f"enc:{f.encrypt(password.encode()).decode()}"
+
+def decrypt_password(encrypted_str: str) -> str:
+    if not encrypted_str:
+        return ""
+    if encrypted_str.startswith("enc:"):
+        try:
+            f = Fernet(ENCRYPTION_KEY.encode())
+            return f.decrypt(encrypted_str[4:].encode()).decode()
+        except Exception as e:
+            logger.error(f"Errore decifratura Fernet: {e}")
+            raise Exception("Impossibile decifrare la password con la chiave attuale")
+    import base64
+    try:
+        return base64.b64decode(encrypted_str.encode()).decode()
+    except Exception as e:
+        logger.error(f"Errore decodifica Base64 fallback: {e}")
+        return encrypted_str
+
+async def get_decrypted_password_and_migrate(conn_doc: dict) -> str:
+    pwd_enc = conn_doc.get("password_enc", "")
+    if not pwd_enc:
+        return ""
+    if pwd_enc.startswith("enc:"):
+        try:
+            f = Fernet(ENCRYPTION_KEY.encode())
+            return f.decrypt(pwd_enc[4:].encode()).decode()
+        except Exception as e:
+            logger.error(f"Errore decifratura Fernet per connessione {conn_doc.get('_id')}: {e}")
+            raise HTTPException(status_code=500, detail="Chiave di cifratura non valida o password corrotta.")
+    else:
+        import base64
+        try:
+            decrypted = base64.b64decode(pwd_enc.encode()).decode()
+            new_pwd_enc = encrypt_password(decrypted)
+            await db.connections.update_one(
+                {"_id": conn_doc["_id"]},
+                {"$set": {"password_enc": new_pwd_enc}}
+            )
+            logger.info(f"Connessione {conn_doc.get('_id')} migrata con successo a cifratura AES-256")
+            return decrypted
+        except Exception as e:
+            logger.error(f"Errore migrazione/decodifica Base64 per connessione {conn_doc.get('_id')}: {e}")
+            return pwd_enc
+
+def is_select_query(sql: str) -> bool:
+    import re
+    no_comments = re.sub(r'--.*$', '', sql, flags=re.MULTILINE)
+    no_comments = re.sub(r'/\*.*?\*/', '', no_comments, flags=re.DOTALL)
+    cleaned = no_comments.strip().upper()
+    return cleaned.startswith("SELECT") or cleaned.startswith("WITH")
+
+async def log_audit(user: dict, action: str, connection_id: str, details: str, rows_count: int):
+    try:
+        conn = None
+        if connection_id:
+            try:
+                conn = await db.connections.find_one({"_id": ObjectId(connection_id)})
+            except:
+                pass
+        
+        audit_entry = {
+            "user_id": str(user.get("_id")),
+            "user_email": user.get("email"),
+            "user_name": user.get("name"),
+            "company": user.get("company", ""),
+            "action": action,
+            "connection_name": conn.get("name") if conn else "Sconosciuta",
+            "connection_host": conn.get("host") if conn else "N/A",
+            "details": details,
+            "rows_count": rows_count,
+            "created_at": datetime.now(timezone.utc)
+        }
+        await db.audit_logs.insert_one(audit_entry)
+        logger.info(f"Audit log registrato: {action} da {user.get('email')}")
+    except Exception as e:
+        logger.error(f"Errore scrittura audit log: {e}")
 
 # ── EMAIL (Resend) ───────────────────────────────────────────
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
@@ -154,6 +257,69 @@ app.add_middleware(
 
 security = HTTPBearer()
 
+# ── AGENT WEBSOCKET CANAL ────────────────────────────────────
+active_agents: Dict[str, WebSocket] = {}
+pending_requests: Dict[str, asyncio.Event] = {}
+request_responses: Dict[str, Any] = {}
+
+async def get_user_license_key(user: dict) -> Optional[str]:
+    lic = await db.licenses.find_one({"user_id": str(user.get("id")), "revoked": {"$ne": True}})
+    if not lic:
+        lic = await db.licenses.find_one({"user_id": str(user.get("_id")), "revoked": {"$ne": True}})
+    return lic.get("license_key") if lic else None
+
+async def send_agent_command(license_key: str, action: str, data: dict, timeout: float = 30.0) -> dict:
+    if license_key not in active_agents:
+        raise HTTPException(status_code=503, detail="L'agente locale per questa licenza non è attualmente connesso.")
+    ws = active_agents[license_key]
+    req_id = str(uuid.uuid4())
+    event = asyncio.Event()
+    pending_requests[req_id] = event
+    payload = {"action": action, "request_id": req_id, "data": data}
+    try:
+        await ws.send_text(json.dumps(payload))
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+        response = request_responses.pop(req_id, {})
+        return response
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout: l'agente locale non ha risposto in tempo.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore di comunicazione con l'agente: {e}")
+    finally:
+        pending_requests.pop(req_id, None)
+        request_responses.pop(req_id, None)
+
+@app.websocket("/api/ws/agent")
+async def ws_agent(websocket: WebSocket, license_key: str):
+    await websocket.accept()
+    lic = await db.licenses.find_one({"license_key": license_key})
+    if not lic or lic.get("revoked") or (lic.get("expires_at") and lic.get("expires_at").replace(tzinfo=timezone.utc) < datetime.now(timezone.utc)):
+        await websocket.close(code=4003, reason="Licenza non valida o scaduta")
+        return
+    if license_key in active_agents:
+        try:
+            await active_agents[license_key].close()
+        except:
+            pass
+    active_agents[license_key] = websocket
+    logger.info(f"Agente connesso con licenza: {license_key}")
+    try:
+        while True:
+            msg_str = await websocket.receive_text()
+            try:
+                msg = json.loads(msg_str)
+                req_id = msg.get("request_id")
+                if req_id in pending_requests:
+                    request_responses[req_id] = msg
+                    pending_requests[req_id].set()
+            except Exception as e:
+                logger.error(f"Errore parsing risposta agente: {e}")
+    except WebSocketDisconnect:
+        logger.info(f"Agente disconnesso con licenza: {license_key}")
+    finally:
+        if active_agents.get(license_key) == websocket:
+            del active_agents[license_key]
+
 # ══════════════════════════════════════════════════════════════
 #  MODELS
 # ══════════════════════════════════════════════════════════════
@@ -189,6 +355,17 @@ class AS400Connection(BaseModel):
     port: int = 446
     library: str = "*LIBL"
     description: Optional[str] = None
+    is_agent_mediated: Optional[bool] = False
+
+class AS400ConnectionUpdate(BaseModel):
+    name: str
+    host: str
+    user: str
+    password: Optional[str] = None
+    port: int = 446
+    library: str = "*LIBL"
+    description: Optional[str] = None
+    is_agent_mediated: Optional[bool] = False
 
 class AS400ConnectionResponse(BaseModel):
     id: str
@@ -200,6 +377,7 @@ class AS400ConnectionResponse(BaseModel):
     description: Optional[str]
     created_at: datetime
     last_used: Optional[datetime]
+    is_agent_mediated: bool = False
 
 class ImportRequest(BaseModel):
     connection_id: str
@@ -226,6 +404,19 @@ class PayPalCaptureRequest(BaseModel):
     payment_id: str
     payer_id: str
     plan_id: str
+
+class ExportColumnConfig(BaseModel):
+    original: str
+    inc: bool
+    outputHeader: str
+    textFormat: str
+
+class ExportPrepareRequest(BaseModel):
+    connection_id: str
+    sql: str
+    format: str
+    columns_config: List[ExportColumnConfig]
+    send_email: Optional[bool] = False
 
 # ══════════════════════════════════════════════════════════════
 #  AUTH HELPERS
@@ -407,7 +598,8 @@ async def get_connections(user = Depends(require_active_plan)):
         "library": c.get("library", "*LIBL"),
         "description": c.get("description"),
         "created_at": c["created_at"].isoformat(),
-        "last_used": c.get("last_used", "").isoformat() if c.get("last_used") else None
+        "last_used": c.get("last_used", "").isoformat() if c.get("last_used") else None,
+        "is_agent_mediated": c.get("is_agent_mediated", False)
     } for c in conns]
 
 @api_router.post("/connections")
@@ -424,9 +616,8 @@ async def create_connection(data: AS400Connection, user = Depends(require_active
             detail=f"Limite connessioni raggiunto ({max_conn}). Aggiorna il piano."
         )
 
-    # Cripta la password
-    import base64
-    encrypted_pwd = base64.b64encode(data.password.encode()).decode()
+    # Cripta la password con AES-256
+    encrypted_pwd = encrypt_password(data.password)
 
     conn = {
         "user_id": str(user["_id"]),
@@ -439,7 +630,8 @@ async def create_connection(data: AS400Connection, user = Depends(require_active
         "description": data.description,
         "created_at": datetime.now(timezone.utc),
         "last_used": None,
-        "is_deleted": False
+        "is_deleted": False,
+        "is_agent_mediated": getattr(data, "is_agent_mediated", False)
     }
     result = await db.connections.insert_one(conn)
     return {"id": str(result.inserted_id), "message": "Connessione creata"}
@@ -452,6 +644,42 @@ async def delete_connection(conn_id: str, user = Depends(get_current_user)):
     )
     return {"message": "Connessione eliminata"}
 
+@api_router.put("/connections/{conn_id}")
+async def update_connection(conn_id: str, data: AS400ConnectionUpdate, user = Depends(require_active_plan)):
+    conn = await db.connections.find_one(
+        {"_id": ObjectId(conn_id), "user_id": str(user["_id"]), "is_deleted": {"$ne": True}}
+    )
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connessione non trovata")
+    
+    update_data = {
+        "name": data.name,
+        "host": data.host,
+        "user": data.user,
+        "port": data.port,
+        "library": data.library,
+        "description": data.description,
+        "is_agent_mediated": getattr(data, "is_agent_mediated", False)
+    }
+    
+    if data.password and data.password.strip():
+        update_data["password_enc"] = encrypt_password(data.password)
+        
+    await db.connections.update_one(
+        {"_id": ObjectId(conn_id)},
+        {"$set": update_data}
+    )
+    
+    await log_audit(
+        user,
+        "edit-connection",
+        conn_id,
+        f"Modificata connessione '{data.name}' ({data.host})",
+        0
+    )
+    
+    return {"message": "Connessione aggiornata"}
+
 @api_router.post("/connections/{conn_id}/test")
 async def test_connection(conn_id: str, user = Depends(require_active_plan)):
     conn = await db.connections.find_one(
@@ -461,19 +689,141 @@ async def test_connection(conn_id: str, user = Depends(require_active_plan)):
         raise HTTPException(status_code=404, detail="Connessione non trovata")
 
     try:
-        import base64
-        password = base64.b64decode(conn["password_enc"]).decode()
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _test_as400_connection, conn["host"], conn["user"], password
-        )
-        if result["success"]:
+        password = await get_decrypted_password_and_migrate(conn)
+        if conn.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            if not license_key:
+                raise HTTPException(status_code=400, detail="Licenza non trovata per questo utente.")
+            result = await send_agent_command(license_key, "test-connection", {
+                "host": conn["host"],
+                "user": conn["user"],
+                "password": password
+            })
+        else:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _test_as400_connection, conn["host"], conn["user"], password
+            )
+        if result.get("success"):
             await db.connections.update_one(
                 {"_id": conn["_id"]},
                 {"$set": {"last_used": datetime.now(timezone.utc)}}
             )
+        # Log audit
+        await log_audit(
+            user,
+            "test-connection",
+            conn_id,
+            f"Test connessione '{conn.get('name')}' ({conn.get('host')}) - Risultato: {'Successo' if result.get('success') else 'Fallito'}",
+            0
+        )
         return result
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+@api_router.get("/connections/{conn_id}/schemas")
+async def get_connection_schemas(conn_id: str, user = Depends(require_active_plan)):
+    conn = await db.connections.find_one({"_id": ObjectId(conn_id), "user_id": str(user["_id"])})
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connessione non trovata")
+    
+    password = await get_decrypted_password_and_migrate(conn)
+    sql = "SELECT DISTINCT SCHEMA_NAME FROM QSYS2.SYSSCHEMAS ORDER BY SCHEMA_NAME"
+    
+    try:
+        if conn.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            res = await send_agent_command(license_key, "query", {
+                "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                "sql": sql, "limit": 1000
+            })
+            if not res.get("success"):
+                sql_fb = "SELECT DISTINCT TABLE_SCHEMA AS SCHEMA_NAME FROM SYSIBM.TABLES ORDER BY TABLE_SCHEMA"
+                res = await send_agent_command(license_key, "query", {
+                    "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                    "sql": sql_fb, "limit": 1000
+                })
+            rows = res.get("rows", [])
+            schemas = [r[0] for r in rows]
+        else:
+            try:
+                res = _sync_query(conn["host"], conn["user"], password, sql, 1000)
+            except:
+                sql_fb = "SELECT DISTINCT TABLE_SCHEMA AS SCHEMA_NAME FROM SYSIBM.TABLES ORDER BY TABLE_SCHEMA"
+                res = _sync_query(conn["host"], conn["user"], password, sql_fb, 1000)
+            schemas = [r["SCHEMA_NAME"] for r in res]
+        return {"schemas": schemas}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore caricamento schemi: {e}")
+
+@api_router.get("/connections/{conn_id}/schemas/{schema}/tables")
+async def get_connection_tables(conn_id: str, schema: str, user = Depends(require_active_plan)):
+    conn = await db.connections.find_one({"_id": ObjectId(conn_id), "user_id": str(user["_id"])})
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connessione non trovata")
+    
+    password = await get_decrypted_password_and_migrate(conn)
+    sql = f"SELECT TABLE_NAME, COALESCE(TABLE_TEXT, '') AS TABLE_TEXT FROM QSYS2.SYSTABLES WHERE TABLE_SCHEMA = '{schema.upper()}' ORDER BY TABLE_NAME"
+    
+    try:
+        if conn.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            res = await send_agent_command(license_key, "query", {
+                "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                "sql": sql, "limit": 1000
+            })
+            if not res.get("success"):
+                sql_fb = f"SELECT TABLE_NAME, '' AS TABLE_TEXT FROM SYSIBM.TABLES WHERE TABLE_SCHEMA = '{schema.upper()}' ORDER BY TABLE_NAME"
+                res = await send_agent_command(license_key, "query", {
+                    "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                    "sql": sql_fb, "limit": 1000
+                })
+            rows = res.get("rows", [])
+            tables = [{"name": r[0], "description": r[1]} for r in rows]
+        else:
+            try:
+                res = _sync_query(conn["host"], conn["user"], password, sql, 1000)
+            except:
+                sql_fb = f"SELECT TABLE_NAME, '' AS TABLE_TEXT FROM SYSIBM.TABLES WHERE TABLE_SCHEMA = '{schema.upper()}' ORDER BY TABLE_NAME"
+                res = _sync_query(conn["host"], conn["user"], password, sql_fb, 1000)
+            tables = [{"name": r["TABLE_NAME"], "description": r["TABLE_TEXT"]} for r in res]
+        return {"tables": tables}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore caricamento tabelle: {e}")
+
+@api_router.get("/connections/{conn_id}/schemas/{schema}/tables/{table}/columns")
+async def get_connection_columns(conn_id: str, schema: str, table: str, user = Depends(require_active_plan)):
+    conn = await db.connections.find_one({"_id": ObjectId(conn_id), "user_id": str(user["_id"])})
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connessione non trovata")
+    
+    password = await get_decrypted_password_and_migrate(conn)
+    sql = f"SELECT COLUMN_NAME, DATA_TYPE, LENGTH, COALESCE(COLUMN_TEXT, '') AS COLUMN_TEXT FROM QSYS2.SYSCOLUMNS WHERE TABLE_SCHEMA = '{schema.upper()}' AND TABLE_NAME = '{table.upper()}' ORDER BY ORDINAL_POSITION"
+    
+    try:
+        if conn.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            res = await send_agent_command(license_key, "query", {
+                "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                "sql": sql, "limit": 1000
+            })
+            if not res.get("success"):
+                sql_fb = f"SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH AS LENGTH, '' AS COLUMN_TEXT FROM SYSIBM.COLUMNS WHERE TABLE_SCHEMA = '{schema.upper()}' AND TABLE_NAME = '{table.upper()}'"
+                res = await send_agent_command(license_key, "query", {
+                    "connection": {"host": conn["host"], "user": conn["user"], "password": password, "port": conn.get("port", 446)},
+                    "sql": sql_fb, "limit": 1000
+                })
+            rows = res.get("rows", [])
+            columns = [{"name": r[0], "type": r[1], "length": r[2], "description": r[3]} for r in rows]
+        else:
+            try:
+                res = _sync_query(conn["host"], conn["user"], password, sql, 1000)
+            except:
+                sql_fb = f"SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH AS LENGTH, '' AS COLUMN_TEXT FROM SYSIBM.COLUMNS WHERE TABLE_SCHEMA = '{schema.upper()}' AND TABLE_NAME = '{table.upper()}'"
+                res = _sync_query(conn["host"], conn["user"], password, sql_fb, 1000)
+            columns = [{"name": r["COLUMN_NAME"], "type": r["DATA_TYPE"], "length": r["LENGTH"], "description": r["COLUMN_TEXT"]} for r in res]
+        return {"columns": columns}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore caricamento colonne: {e}")
 
 def _test_as400_connection(host: str, user: str, password: str) -> dict:
     """Test connessione AS/400 sincrona (eseguita in thread)"""
@@ -495,6 +845,54 @@ def _test_as400_connection(host: str, user: str, password: str) -> dict:
 # ══════════════════════════════════════════════════════════════
 #  IMPORT
 # ══════════════════════════════════════════════════════════════
+
+@api_router.post("/import/preview")
+async def import_preview(file: UploadFile = File(...), user = Depends(require_active_plan)):
+    try:
+        content = await file.read()
+        filename = file.filename
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
+        
+        import pandas as pd
+        import io
+        
+        # Leggi dataframe
+        if ext in ["xlsx", "xls"]:
+            df = pd.read_excel(io.BytesIO(content))
+        elif ext == "xml":
+            df = pd.read_xml(io.BytesIO(content))
+        else:
+            df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
+            
+        columns = list(df.columns)
+        df_preview = df.head(5).fillna("")
+        preview_data = df_preview.values.tolist()
+        
+        # Rileva tipi suggeriti
+        suggested_types = {}
+        for col in columns:
+            series = df[col].dropna()
+            if series.empty:
+                suggested_types[col] = "VARCHAR(255)"
+                continue
+            if pd.api.types.is_integer_dtype(series):
+                suggested_types[col] = "INTEGER"
+            elif pd.api.types.is_numeric_dtype(series):
+                suggested_types[col] = "DECIMAL(15,4)"
+            elif pd.api.types.is_datetime64_any_dtype(series):
+                suggested_types[col] = "TIMESTAMP"
+            else:
+                max_len = int(series.astype(str).str.len().max())
+                buffer_len = max(50, min(1000, (max_len // 50 + 1) * 50))
+                suggested_types[col] = f"VARCHAR({buffer_len})"
+                
+        return {
+            "columns": columns,
+            "preview": preview_data,
+            "suggested_types": suggested_types
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Errore lettura anteprima file: {e}")
 
 @api_router.post("/import")
 async def import_data(
@@ -593,16 +991,36 @@ async def _run_import(op_id, content, ext, request, user, plan):
         if not conn_doc:
             raise Exception("Connessione non trovata")
 
-        import base64
-        password = base64.b64decode(conn_doc["password_enc"]).decode()
+        password = await get_decrypted_password_and_migrate(conn_doc)
 
-        # Import AS/400 in thread
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _sync_import,
-            conn_doc["host"], conn_doc["user"], password,
-            request.library, request.table_name, request.mode,
-            df, request.field_config
-        )
+        if conn_doc.get("is_agent_mediated"):
+            import base64
+            file_content_b64 = base64.b64encode(content).decode()
+            license_key = await get_user_license_key(user)
+            if not license_key:
+                raise Exception("Licenza non trovata per questo utente.")
+            result = await send_agent_command(license_key, "import", {
+                "connection": {
+                    "host": conn_doc["host"],
+                    "user": conn_doc["user"],
+                    "password": password,
+                    "port": conn_doc.get("port", 446)
+                },
+                "library": request.library,
+                "table_name": request.table_name,
+                "mode": request.mode,
+                "file_content_b64": file_content_b64,
+                "file_ext": ext,
+                "field_config": request.field_config
+            }, timeout=300.0)
+        else:
+            # Import AS/400 in thread
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _sync_import,
+                conn_doc["host"], conn_doc["user"], password,
+                request.library, request.table_name, request.mode,
+                df, request.field_config
+            )
 
         await db.operations.update_one(
             {"id": op_id},
@@ -613,11 +1031,31 @@ async def _run_import(op_id, content, ext, request, user, plan):
                 "completed_at": datetime.now(timezone.utc)
             }}
         )
+        # Log audit per completamento
+        op_doc = await db.operations.find_one({"id": op_id})
+        filename = op_doc.get("filename", "unknown")
+        details = f"Import tabella {request.library}.{request.table_name} ({request.mode}) da file '{filename}' - Risultato: {'Completato' if result.get('success') else 'Fallito'}"
+        await log_audit(
+            user,
+            "import",
+            request.connection_id,
+            details,
+            result.get("inserted", 0) if result.get("success") else 0
+        )
 
     except Exception as e:
         await db.operations.update_one(
             {"id": op_id},
             {"$set": {"status": "failed", "error": str(e)}}
+        )
+        # Log audit per errore prima del completamento
+        details = f"Import tabella {request.library}.{request.table_name} ({request.mode}) fallito: {e}"
+        await log_audit(
+            user,
+            "import-error",
+            request.connection_id,
+            details,
+            0
         )
 
 def _sync_import(host, user, password, library, table_name, mode, df, field_config):
@@ -664,13 +1102,21 @@ def _sync_import(host, user, password, library, table_name, mode, df, field_conf
             sql = f"INSERT INTO {library}.{table_name} ({cols_str}) VALUES ({placeholders})"
             for i in range(0, len(data_rows), 500):
                 batch = data_rows[i:i+500]
+                batch_vals = []
                 for row in batch:
                     vals = [None if (v is None or (isinstance(v, float) and v != v)) else v for v in row]
-                    try:
-                        cursor.execute(sql, vals)
-                        inserted += 1
-                    except Exception as row_err:
-                        errors.append(str(row_err))
+                    batch_vals.append(vals)
+                try:
+                    cursor.executemany(sql, batch_vals)
+                    inserted += len(batch)
+                except Exception as batch_err:
+                    logger.warning(f"Batch insert fallito nel server cloud, fallback riga per riga: {batch_err}")
+                    for vals in batch_vals:
+                        try:
+                            cursor.execute(sql, vals)
+                            inserted += 1
+                        except Exception as row_err:
+                            errors.append(str(row_err))
                 conn.commit()
 
         cursor.close()
@@ -702,6 +1148,13 @@ async def get_import_status(op_id: str, user = Depends(get_current_user)):
 
 @api_router.post("/query")
 async def execute_query(data: QueryRequest, user = Depends(require_active_plan)):
+    # Valida query in sola lettura
+    if not is_select_query(data.sql):
+        raise HTTPException(
+            status_code=400,
+            detail="Operazione non consentita. Sono permesse solo query di lettura (SELECT o WITH)."
+        )
+
     conn_doc = await db.connections.find_one(
         {"_id": ObjectId(data.connection_id), "user_id": str(user["_id"])}
     )
@@ -709,13 +1162,32 @@ async def execute_query(data: QueryRequest, user = Depends(require_active_plan))
         raise HTTPException(status_code=404, detail="Connessione non trovata")
 
     # Controlla formato export nel piano
-    import base64
-    password = base64.b64decode(conn_doc["password_enc"]).decode()
+    password = await get_decrypted_password_and_migrate(conn_doc)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _sync_query, conn_doc["host"], conn_doc["user"], password, data.sql, data.limit
-        )
+        if conn_doc.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            if not license_key:
+                raise HTTPException(status_code=400, detail="Licenza non trovata per questo utente.")
+            agent_res = await send_agent_command(license_key, "query", {
+                "connection": {
+                    "host": conn_doc["host"],
+                    "user": conn_doc["user"],
+                    "password": password,
+                    "port": conn_doc.get("port", 446)
+                },
+                "sql": data.sql,
+                "limit": data.limit
+            }, timeout=60.0)
+            if not agent_res.get("success"):
+                raise Exception(agent_res.get("error", "Errore sconosciuto dell'agente"))
+            cols = agent_res.get("columns", [])
+            rows_data = agent_res.get("rows", [])
+            result = [dict(zip(cols, [str(v) if v is not None else "" for v in row])) for row in rows_data]
+        else:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _sync_query, conn_doc["host"], conn_doc["user"], password, data.sql, data.limit
+            )
 
         # Log operazione export
         await db.operations.insert_one({
@@ -728,9 +1200,398 @@ async def execute_query(data: QueryRequest, user = Depends(require_active_plan))
             "created_at": datetime.now(timezone.utc)
         })
 
+        # Log audit
+        await log_audit(
+            user,
+            "query",
+            data.connection_id,
+            f"Query SQL eseguita: {data.sql}",
+            len(result)
+        )
+
         return {"data": result, "rows": len(result)}
     except Exception as e:
+        await log_audit(
+            user,
+            "query-error",
+            data.connection_id,
+            f"Errore query SQL ({data.sql}): {e}",
+            0
+        )
         raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/export/prepare")
+async def export_prepare(data: ExportPrepareRequest, user = Depends(require_active_plan)):
+    token = str(uuid.uuid4())
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
+    
+    await db.export_prepares.insert_one({
+        "token": token,
+        "user_id": str(user["_id"]),
+        "connection_id": data.connection_id,
+        "sql": data.sql,
+        "format": data.format,
+        "columns_config": [c.model_dump() for c in data.columns_config],
+        "send_email": data.send_email,
+        "expires_at": expiry
+    })
+    return {"token": token}
+
+@api_router.get("/export/download/{token}")
+async def export_download(token: str, background_tasks: BackgroundTasks):
+    prep = await db.export_prepares.find_one({"token": token})
+    if not prep:
+        raise HTTPException(status_code=404, detail="Token di download non valido o scaduto.")
+        
+    expires_at = prep.get("expires_at")
+    if expires_at and expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="Token scaduto. Rigenera il file.")
+        
+    user_id = prep.get("user_id")
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utente non trovato.")
+        
+    connection_id = prep.get("connection_id")
+    sql = prep.get("sql")
+    fmt = prep.get("format", "xlsx")
+    columns_config = prep.get("columns_config", [])
+    send_email = prep.get("send_email", False)
+    
+    conn_doc = await db.connections.find_one({
+        "_id": ObjectId(connection_id), "user_id": user_id
+    })
+    if not conn_doc:
+        raise HTTPException(status_code=404, detail="Connessione non trovata")
+        
+    password = await get_decrypted_password_and_migrate(conn_doc)
+    
+    try:
+        if conn_doc.get("is_agent_mediated"):
+            license_key = await get_user_license_key(user)
+            if not license_key:
+                raise Exception("Licenza non trovata per questo utente.")
+            agent_res = await send_agent_command(license_key, "query", {
+                "connection": {
+                    "host": conn_doc["host"],
+                    "user": conn_doc["user"],
+                    "password": password,
+                    "port": conn_doc.get("port", 446)
+                },
+                "sql": sql,
+                "limit": None
+            }, timeout=300.0)
+            if not agent_res.get("success"):
+                raise Exception(agent_res.get("error", "Errore sconosciuto dell'agente"))
+            cols = agent_res.get("columns", [])
+            rows_data = agent_res.get("rows", [])
+            raw_data = [dict(zip(cols, [v if v is not None else "" for v in row])) for row in rows_data]
+        else:
+            raw_data = await asyncio.get_event_loop().run_in_executor(
+                None, _sync_query, conn_doc["host"], conn_doc["user"], password, sql, None
+            )
+    except Exception as e:
+        logger.error(f"Errore esecuzione query per export: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nel recupero dei dati da AS/400: {e}")
+        
+    if not raw_data:
+        raise HTTPException(status_code=400, detail="La query non ha restituito alcun dato.")
+        
+    import pandas as pd
+    df = pd.DataFrame(raw_data)
+    
+    if columns_config:
+        inc_configs = [c for c in columns_config if c.get("inc", True)]
+        columns_to_keep = [c.get("original") for c in inc_configs if c.get("original") in df.columns]
+        
+        if columns_to_keep:
+            df = df[columns_to_keep]
+            rename_dict = {}
+            for c in inc_configs:
+                orig = c.get("original")
+                if orig not in df.columns:
+                    continue
+                out_header = c.get("outputHeader", orig)
+                txt_format = c.get("textFormat", "nessuno")
+                
+                if txt_format == "maiuscolo":
+                    df[orig] = df[orig].astype(str).str.upper()
+                elif txt_format == "minuscolo":
+                    df[orig] = df[orig].astype(str).str.lower()
+                    
+                rename_dict[orig] = out_header
+                
+            df = df.rename(columns=rename_dict)
+            
+    try:
+        content_type = "application/octet-stream"
+        filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{fmt}"
+        
+        if fmt == "xlsx":
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_bytes = _generate_xlsx_bytes(df)
+        elif fmt == "csv":
+            content_type = "text/csv"
+            file_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        elif fmt == "tsv":
+            content_type = "text/tab-separated-values"
+            file_bytes = df.to_csv(index=False, sep="\t", encoding="utf-8-sig").encode("utf-8-sig")
+        elif fmt == "json":
+            content_type = "application/json"
+            file_bytes = df.to_json(orient="records", indent=2).encode("utf-8")
+        elif fmt == "xml":
+            content_type = "application/xml"
+            file_bytes = _generate_xml_bytes(df)
+        elif fmt == "pdf":
+            content_type = "application/pdf"
+            file_bytes = _generate_pdf_bytes(df, filename)
+        else:
+            raise Exception(f"Formato non supportato: {fmt}")
+            
+    except Exception as e:
+        logger.error(f"Errore generazione file export: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nella generazione del file di export: {e}")
+        
+    if send_email:
+        background_tasks.add_task(
+            _send_export_email_task, user.get("email"), user.get("name"), filename, file_bytes, content_type
+        )
+        
+    await log_audit(
+        user,
+        "export-download",
+        connection_id,
+        f"Export file '{filename}' ({fmt}) scaricato con successo. Righe: {len(df)}",
+        len(df)
+    )
+    
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{filename}\"",
+        "Access-Control-Expose-Headers": "Content-Disposition"
+    }
+    return Response(content=file_bytes, media_type=content_type, headers=headers)
+
+def _generate_xlsx_bytes(df) -> bytes:
+    import io
+    import pandas as pd
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # Convert numeric columns where possible
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col])
+        except:
+            pass
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name="Export")
+        
+        # Get workbook and sheet
+        workbook = writer.book
+        worksheet = writer.sheets["Export"]
+        
+        # Enable grid lines visible
+        worksheet.views.sheetView[0].showGridLines = True
+        
+        # Define styles
+        header_font = Font(name='Segoe UI', size=11, bold=True, color='FFFFFF')
+        header_fill = PatternFill(start_color='1F4E78', end_color='1F4E78', fill_type='solid')
+        header_alignment = Alignment(horizontal='left', vertical='center')
+        
+        cell_font = Font(name='Segoe UI', size=10)
+        
+        thin_side = Side(style='thin', color='E2E8F0')
+        cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+        
+        # Style the headers
+        worksheet.row_dimensions[1].height = 26
+        for col_idx in range(1, len(df.columns) + 1):
+            cell = worksheet.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = cell_border
+            
+        # Style the data rows and auto-fit column widths
+        col_widths = {}
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            max_len = len(str(col_name))
+            col_widths[col_idx] = max_len
+            
+        for row_idx in range(2, worksheet.max_row + 1):
+            worksheet.row_dimensions[row_idx].height = 20
+            for col_idx in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                cell.font = cell_font
+                cell.alignment = Alignment(
+                    horizontal='right' if cell.data_type in ['n', 'f'] else 'left', 
+                    vertical='center'
+                )
+                cell.border = cell_border
+                
+                # Check value length for auto-width
+                val_str = str(cell.value) if cell.value is not None else ""
+                col_widths[col_idx] = max(col_widths[col_idx], len(val_str))
+                
+        # Set column widths
+        for col_idx, width in col_widths.items():
+            col_letter = get_column_letter(col_idx)
+            worksheet.column_dimensions[col_letter].width = max(width + 4, 12)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def _generate_xml_bytes(df) -> bytes:
+    import io
+    import xml.etree.ElementTree as ET
+    root = ET.Element("export")
+    for idx, row in df.iterrows():
+        row_el = ET.SubElement(root, "row")
+        for col in df.columns:
+            clean_col = "".join([c if c.isalnum() else "_" for c in str(col)])
+            if not clean_col or not clean_col[0].isalpha():
+                clean_col = "col_" + clean_col
+            col_el = ET.SubElement(row_el, clean_col)
+            col_el.text = str(row[col]) if row[col] is not None else ""
+    buffer = io.BytesIO()
+    tree = ET.ElementTree(root)
+    tree.write(buffer, encoding="utf-8", xml_declaration=True)
+    return buffer.getvalue()
+
+def _generate_pdf_bytes(df, filename: str) -> bytes:
+    import io
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    
+    buffer = io.BytesIO()
+    pagesize = landscape(letter) if len(df.columns) > 5 else letter
+    doc = SimpleDocTemplate(buffer, pagesize=pagesize, rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    story = []
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Heading1'],
+        fontSize=12,
+        leading=14,
+        textColor=colors.HexColor("#1e293b"),
+        spaceAfter=10
+    )
+    cell_style = ParagraphStyle(
+        'CellStyle',
+        parent=styles['Normal'],
+        fontSize=7,
+        leading=9
+    )
+    header_style = ParagraphStyle(
+        'HeaderStyle',
+        parent=styles['Normal'],
+        fontSize=7,
+        leading=9,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor("#ffffff")
+    )
+    
+    story.append(Paragraph(f"Export Dati - {filename}", title_style))
+    story.append(Spacer(1, 10))
+    
+    pdf_df = df.head(500)
+    data = []
+    data.append([Paragraph(str(col), header_style) for col in pdf_df.columns])
+    
+    for idx, row in pdf_df.iterrows():
+        data.append([Paragraph(str(val) if val is not None else "", cell_style) for val in row])
+        
+    col_width = (doc.width) / len(pdf_df.columns)
+    table = Table(data, colWidths=[col_width] * len(pdf_df.columns))
+    
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1e293b")),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+        ('RIGHTPADDING', (0,0), (-1,-1), 4),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+    ]))
+    
+    story.append(table)
+    
+    if len(df) > 500:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(f"* Nota: Mostrate le prime 500 righe di {len(df)} totali nel PDF.", cell_style))
+        
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+async def _send_export_email_task(email: str, name: str, filename: str, file_bytes: bytes, content_type: str):
+    if not SENDGRID_API_KEY and not RESEND_API_KEY:
+        logger.warning("Nessuna chiave API email configurata (Sendgrid/Resend). Invio email saltato.")
+        return
+        
+    import base64
+    file_b64 = base64.b64encode(file_bytes).decode()
+    
+    subject = f"Il tuo file di esportazione è pronto: {filename}"
+    html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:40px;background:#0f1117;border-radius:12px;color:#ffffff;">
+<h1 style="color:#4f9cf9;text-align:center;">Esportazione Completata! 📊</h1>
+<p style="color:#9ca3af;">Ciao {name},</p>
+<p style="color:#9ca3af;">Il file richiesto <strong>{filename}</strong> è pronto ed è allegato a questa email.</p>
+<p style="color:#4b5563;font-size:12px;text-align:center;margin-top:40px;">© 2026 Ikonet Solutions</p>
+</div>"""
+
+    if RESEND_API_KEY:
+        try:
+            logger.info("Tentativo invio email con Resend...")
+            resend.Emails.send({
+                "from": SENDER_EMAIL,
+                "to": email,
+                "subject": subject,
+                "html": html,
+                "attachments": [
+                    {
+                        "filename": filename,
+                        "content": list(file_bytes)
+                    }
+                ]
+            })
+            logger.info(f"Email di export inviata via Resend a {email}")
+            return
+        except Exception as e:
+            logger.error(f"Errore invio email con Resend: {e}")
+            
+    if SENDGRID_API_KEY:
+        try:
+            logger.info("Tentativo invio email con Sendgrid...")
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+            sg = SendGridAPIClient(SENDGRID_API_KEY)
+            
+            message = Mail(
+                from_email=SENDER_EMAIL,
+                to_emails=email,
+                subject=subject,
+                html_content=html
+            )
+            
+            attached_file = Attachment(
+                FileContent(file_b64),
+                FileName(filename),
+                FileType(content_type),
+                Disposition('attachment')
+            )
+            message.attachment = attached_file
+            
+            sg.send(message)
+            logger.info(f"Email di export inviata via SendGrid a {email}")
+        except Exception as e:
+            logger.error(f"Errore invio email con Sendgrid: {e}")
 
 def _sync_query(host, user, password, sql, limit):
     """Esegue query AS/400 sincrona"""
@@ -755,6 +1616,30 @@ def _sync_query(host, user, password, sql, limit):
     conn.close()
 
     return [dict(zip(columns, [str(v) if v is not None else "" for v in row])) for row in rows]
+
+@api_router.get("/audit-logs")
+async def get_audit_logs(user = Depends(get_current_user)):
+    # Solo amministratori
+    if user.get("role") != "admin" and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato. Solo gli amministratori possono accedere al registro di audit.")
+    
+    query = {}
+    if not user.get("is_admin"):
+        query["company"] = user.get("company", "")
+        
+    logs = await db.audit_logs.find(query).sort("created_at", -1).limit(300).to_list(300)
+    return [{
+        "id": str(l["_id"]),
+        "user_email": l["user_email"],
+        "user_name": l["user_name"],
+        "company": l.get("company", ""),
+        "action": l["action"],
+        "connection_name": l.get("connection_name", "N/A"),
+        "connection_host": l.get("connection_host", ""),
+        "details": l["details"],
+        "rows_count": l.get("rows_count", 0),
+        "created_at": l["created_at"].isoformat()
+    } for l in logs]
 
 # ══════════════════════════════════════════════════════════════
 #  SAVED QUERIES
@@ -1077,8 +1962,6 @@ async def send_trial_reminders(user = Depends(get_current_user)):
         await db.users.update_one({"_id": u["_id"]}, {"$set": {"trial_reminder_sent": True}})
     return {"sent": sent}
 
-app.include_router(api_router)
-
 # Serve frontend statico
 if os.path.exists("/app/frontend/build"):
     app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
@@ -1202,3 +2085,5 @@ async def reset_hardware(license_key: str, user=Depends(get_current_user)):
         {"$set": {"hardware_id": None, "hostname": None, "suspicious_attempts": 0}}
     )
     return {"message": "Hardware reset eseguito"}
+
+app.include_router(api_router)

@@ -19,3 +19,5 @@ httpx==0.28.1
 paypalrestsdk==1.13.1
 resend==2.0.0
 sendgrid==6.11.0
+cryptography==42.0.5
+reportlab==5.0.0
