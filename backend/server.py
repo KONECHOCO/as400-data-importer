@@ -500,8 +500,26 @@ async def register(data: UserRegister, background_tasks: BackgroundTasks):
     }
     await db.users.insert_one(user)
 
-    # Email di benvenuto
-    background_tasks.add_task(send_welcome_email, data.email, data.name, trial_ends)
+    # Genera licenza di prova (trial) per 14 giorni
+    license_key = generate_license_key(user_id)
+    license_doc = {
+        "license_key": license_key,
+        "user_id": user_id,
+        "plan": "starter",
+        "expires_at": trial_ends,
+        "max_connections": 1,
+        "notes": "Trial license generated automatically on registration",
+        "revoked": False,
+        "hardware_id": None,
+        "hostname": None,
+        "suspicious_attempts": 0,
+        "features": ["import", "export", "query"],
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.licenses.insert_one(license_doc)
+
+    # Email di benvenuto con licenza e download link
+    background_tasks.add_task(send_welcome_email, data.email, data.name, trial_ends, license_key)
 
     token = create_token(str(user["_id"]), user["email"], user["role"])
     return {
@@ -1804,30 +1822,87 @@ async def capture_subscription_payment(
 #  EMAIL HELPERS
 # ══════════════════════════════════════════════════════════════
 
-async def send_welcome_email(email: str, name: str, trial_ends: datetime):
-    if not SENDGRID_API_KEY:
+async def send_welcome_email(email: str, name: str, trial_ends: datetime, license_key: str):
+    if not SENDGRID_API_KEY and not RESEND_API_KEY:
+        logger.warning("Nessuna chiave API email configurata (Sendgrid/Resend). Welcome email non inviata.")
         return
-    try:
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Mail
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        msg = Mail(
-            from_email="supporto@ikonetsolutions.com",
-            to_emails=email,
-            subject="Benvenuto su AS400 Data Importer — 14 giorni gratis!",
-            html_content=f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:40px;background:#0f1117;border-radius:12px;">
-<h1 style="color:#4f9cf9;text-align:center;">Benvenuto, {name}! 👋</h1>
-<p style="color:#9ca3af;">Il tuo periodo di prova gratuita è attivo fino al <strong style="color:#fff;">{trial_ends.strftime('%d/%m/%Y')}</strong>.</p>
-<div style="text-align:center;margin:30px 0;">
-<a href="{FRONTEND_URL}" style="background:#4f9cf9;color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;">Inizia ora →</a>
-</div>
-<p style="color:#4b5563;font-size:12px;text-align:center;">© 2026 Ikonet Solutions</p>
+
+    subject = "Benvenuto su AS400 Data Importer — 14 giorni gratis!"
+    html_content = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:40px;background:#0d0f1a;border-radius:16px;color:#fff;border:1px solid #1e293b;">
+  <!-- Header -->
+  <div style="margin-bottom:30px;border-bottom:1px solid #1e293b;padding-bottom:20px;">
+    <div style="width:36px;height:36px;background:linear-gradient(to bottom right, #3b82f6, #10b981);border-radius:8px;display:inline-block;text-align:center;line-height:36px;font-weight:900;color:white;font-size:16px;margin-right:12px;vertical-align:middle;">IK</div>
+    <div style="display:inline-block;vertical-align:middle;">
+      <div style="color:white;font-weight:700;font-size:16px;line-height:1.2;margin:0;">ikonet</div>
+      <div style="color:#60a5fa;font-size:10px;letter-spacing:2px;font-weight:700;margin:0;">AS400 DATA IMPORTER</div>
+    </div>
+  </div>
+
+  <!-- Body -->
+  <h1 style="font-size:24px;font-weight:700;color:#fff;margin-top:0;margin-bottom:15px;">Benvenuto, {name}! 👋</h1>
+  <p style="color:#94a3b8;font-size:15px;line-height:1.6;margin-bottom:25px;">Il tuo account è attivo su <strong>AS400 Data Importer</strong>. Segui i 2 passi qui sotto per iniziare subito.</p>
+
+  <!-- Step 1 -->
+  <div style="margin-bottom:30px;background:#151824;padding:20px;border-radius:12px;border:1px solid #1e293b;">
+    <h2 style="font-size:16px;font-weight:700;color:#3b82f6;margin-top:0;margin-bottom:10px;">
+      Scarica e installa l'applicazione
+    </h2>
+    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:20px;">Clicca il pulsante per scaricare il programma per Windows (51 MB). Dopo l'installazione avvialo dal desktop.</p>
+    <div style="text-align:center;margin-bottom:15px;">
+      <a href="{FRONTEND_URL}/agent.exe" style="background:#2563eb;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;border:1px solid #3b82f6;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);">⬇ Scarica AS400 Data Importer (.exe)</a>
+    </div>
+    <div style="color:#64748b;font-size:11px;text-align:center;">Windows 10/11 — 64 bit · Richiede Java (JRE 8+)</div>
+  </div>
+
+  <!-- Step 2 -->
+  <div style="margin-bottom:30px;background:#151824;padding:20px;border-radius:12px;border:1px solid #1e293b;">
+    <h2 style="font-size:16px;font-weight:700;color:#10b981;margin-top:0;margin-bottom:10px;">
+      Attiva la licenza di prova
+    </h2>
+    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:15px;">Avvia l'applicazione sul tuo PC e inserisci la seguente licenza di prova gratuita (valida per 14 giorni):</p>
+    <div style="background:#0d0f1a;border:1px dashed #10b981;color:#34d399;padding:14px;border-radius:8px;font-family:monospace;font-size:18px;text-align:center;letter-spacing:1px;font-weight:700;margin:15px 0;">
+      {license_key}
+    </div>
+    <div style="color:#64748b;font-size:11px;text-align:center;">Questo codice di prova scade il {trial_ends.strftime('%d/%m/%Y')}.</div>
+  </div>
+
+  <!-- Footer -->
+  <div style="border-top:1px solid #1e293b;padding-top:20px;text-align:center;">
+    <p style="color:#94a3b8;font-size:13px;line-height:1.5;">Per qualsiasi dubbio o supporto, rispondi a questa email.</p>
+    <p style="color:#475569;font-size:11px;margin-top:20px;">© 2026 Ikonet Solutions</p>
+  </div>
 </div>"""
-        )
-        sg.send(msg)
-        logger.info(f"Welcome email inviata a {email}")
-    except Exception as e:
-        logger.error(f"Errore welcome email: {e}")
+
+    if RESEND_API_KEY:
+        try:
+            logger.info("Tentativo invio welcome email con Resend...")
+            resend.Emails.send({
+                "from": SENDER_EMAIL,
+                "to": email,
+                "subject": subject,
+                "html": html_content
+            })
+            logger.info(f"Welcome email inviata via Resend a {email}")
+            return
+        except Exception as e:
+            logger.error(f"Errore welcome email Resend: {e}")
+
+    if SENDGRID_API_KEY:
+        try:
+            logger.info("Tentativo invio welcome email con SendGrid...")
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+            sg = SendGridAPIClient(SENDGRID_API_KEY)
+            msg = Mail(
+                from_email=SENDER_EMAIL,
+                to_emails=email,
+                subject=subject,
+                html_content=html_content
+            )
+            sg.send(msg)
+            logger.info(f"Welcome email inviata via SendGrid a {email}")
+        except Exception as e:
+            logger.error(f"Errore welcome email SendGrid: {e}")
 
 
 async def send_subscription_email(email: str, name: str, plan: dict, expires: datetime):
