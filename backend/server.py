@@ -2027,6 +2027,9 @@ async def send_trial_reminders(user = Depends(get_current_user)):
 <div style="text-align:center;margin:30px 0;">
 <a href="{FRONTEND_URL}/plans" style="background:#4f9cf9;color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;">Scegli il piano →</a>
 </div>
+<div style="text-align:center;margin:20px 0;">
+<a href="{FRONTEND_URL}/download" style="background:#22c55e;color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;">⬇ Scarica l'installer</a>
+</div>
 <p style="color:#4b5563;font-size:12px;text-align:center;">© 2026 Ikonet Solutions</p>
 </div>"""
                 )
