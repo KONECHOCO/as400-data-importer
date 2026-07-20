@@ -385,7 +385,7 @@ async def _ws_loop():
         ws_url = get_ws_url()
         log.info(f"Connessione al canale WebSocket del Cloud: {ws_url.split('?')[0]}")
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, max_size=500 * 1024 * 1024) as ws:
                 log.info("Connessione WebSocket stabilita con il Cloud!")
                 while True:
                     msg_str = await ws.recv()
@@ -488,5 +488,8 @@ async def _license_loop():
         await verify_license_with_cloud()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, reload=False)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, reload=False)
+    except Exception as e:
+        uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT + 1, reload=False)
 

@@ -15,4 +15,4 @@ COPY frontend/ ./frontend/
 ENV STATIC_DIR=/app/frontend/build
 EXPOSE 8003
 
-CMD ["uvicorn", "backend.server:app", "--host", "0.0.0.0", "--port", "8003"]
+CMD ["uvicorn", "backend.server:app", "--host", "0.0.0.0", "--port", "8003", "--ws-max-size", "500000000"]
