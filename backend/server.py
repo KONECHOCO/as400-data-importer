@@ -1064,6 +1064,16 @@ async def import_preview(file: UploadFile = File(...), user = Depends(require_ac
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Errore lettura anteprima file: {e}")
 
+TEMP_IMPORT_FILES = {}
+
+@api_router.get("/agent/download-import-file/{file_token}")
+async def download_import_file(file_token: str):
+    if file_token not in TEMP_IMPORT_FILES:
+        raise HTTPException(status_code=404, detail="File non trovato o scaduto")
+    data = TEMP_IMPORT_FILES[file_token]
+    from fastapi.responses import Response
+    return Response(content=data["content"], media_type="application/octet-stream")
+
 @api_router.post("/import")
 async def import_data(
     file: UploadFile = File(...),
@@ -1159,8 +1169,20 @@ async def _run_import(op_id, content, ext, request, user, plan):
         password = await get_decrypted_password_and_migrate(conn_doc)
 
         if conn_doc.get("is_agent_mediated"):
-            import base64
-            file_content_b64 = base64.b64encode(content).decode()
+            file_token = str(uuid.uuid4())
+            TEMP_IMPORT_FILES[file_token] = {
+                "content": content,
+                "ext": ext,
+                "created_at": time.time()
+            }
+            # Pulisci file vecchi più di 30 minuti
+            now = time.time()
+            for k in list(TEMP_IMPORT_FILES.keys()):
+                if now - TEMP_IMPORT_FILES[k]["created_at"] > 1800:
+                    TEMP_IMPORT_FILES.pop(k, None)
+
+            file_url = f"https://as400.ikonetsolutions.com/api/agent/download-import-file/{file_token}"
+
             license_key = await get_user_license_key(user)
             if not license_key:
                 raise Exception("Licenza non trovata per questo utente.")
@@ -1174,10 +1196,10 @@ async def _run_import(op_id, content, ext, request, user, plan):
                 "library": request.library,
                 "table_name": request.table_name,
                 "mode": request.mode,
-                "file_content_b64": file_content_b64,
+                "file_url": file_url,
                 "file_ext": ext,
                 "field_config": request.field_config
-            }, timeout=300.0)
+            }, timeout=600.0)
         else:
             # Import AS/400 in thread
             result = await asyncio.get_event_loop().run_in_executor(

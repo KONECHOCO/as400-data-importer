@@ -435,11 +435,22 @@ async def _handle_ws_command(ws, action: str, req_id: str, req_data: dict):
                 password=conn_data.get("password"),
                 port=conn_data.get("port", 23)
             )
-            file_content_b64 = req_data.get("file_content_b64")
             file_ext = req_data.get("file_ext", "csv")
             
+            # Ottieni i bytes del file (via HTTP download o base64)
+            if req_data.get("file_url"):
+                import requests
+                log.info(f"Scaricamento file dal Cloud: {req_data['file_url']}")
+                r = requests.get(req_data["file_url"], timeout=300)
+                if r.status_code != 200:
+                    raise Exception(f"Impossibile scaricare il file dal Cloud (HTTP {r.status_code})")
+                file_bytes = r.content
+            elif req_data.get("file_content_b64"):
+                file_bytes = base64.b64decode(req_data["file_content_b64"])
+            else:
+                raise Exception("Nessun contenuto file fornito")
+
             # Scrivi il file temporaneo
-            file_bytes = base64.b64decode(file_content_b64)
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp:
                 tmp.write(file_bytes)
                 tmp_path = tmp.name
