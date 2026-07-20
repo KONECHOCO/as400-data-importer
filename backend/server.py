@@ -1167,7 +1167,7 @@ async def _run_import(op_id, content, ext, request, user, plan):
         if not conn_doc:
             raise Exception("Connessione non trovata")
 
-        password = await get_decrypted_password_and_migrate(conn_doc)
+        password = await get_decrypted_password_and_migrate(conn_doc) or ""
 
         if conn_doc.get("is_agent_mediated"):
             file_token = str(uuid.uuid4())

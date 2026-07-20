@@ -177,10 +177,12 @@ def _get_jar_path() -> str:
 def _open_as400_connection(host: str, user: str, password: str):
     import jaydebeapi
     jar_path = _get_jar_path()
+    u = str(user).upper() if user else ""
+    p = str(password) if password is not None else ""
     return jaydebeapi.connect(
         "com.ibm.as400.access.AS400JDBCDriver",
         f"jdbc:as400://{host}/;naming=system;errors=full;",
-        [user.upper(), password], jar_path)
+        [u, p], jar_path)
 
 def _test_as400_connection(host: str, user: str, password: str) -> dict:
     try:
