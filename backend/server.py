@@ -476,11 +476,30 @@ def hash_password(password: str) -> str:
     return pwd_ctx.hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
-    try:
-        return pwd_ctx.verify(password, hashed)
-    except Exception as e:
-        logger.error(f"Errore verifica password: {e}")
+    if not password or not hashed:
         return False
+    try:
+        if pwd_ctx.verify(password, hashed):
+            return True
+    except Exception:
+        pass
+    try:
+        import crypt
+        if crypt.crypt(password, hashed) == hashed:
+            return True
+    except Exception:
+        pass
+    try:
+        from passlib.hash import sha256_crypt, pbkdf2_sha256, sha512_crypt
+        for scheme in [sha256_crypt, pbkdf2_sha256, sha512_crypt]:
+            try:
+                if scheme.verify(password, hashed):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {
