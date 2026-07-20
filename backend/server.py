@@ -1182,6 +1182,8 @@ async def _run_import(op_id, content, ext, request, user, plan):
                 if now - TEMP_IMPORT_FILES[k]["created_at"] > 1800:
                     TEMP_IMPORT_FILES.pop(k, None)
 
+            import base64
+            file_content_b64 = base64.b64encode(content).decode()
             file_url = f"https://as400.ikonetsolutions.com/api/agent/download-import-file/{file_token}"
 
             license_key = await get_user_license_key(user)
@@ -1189,16 +1191,17 @@ async def _run_import(op_id, content, ext, request, user, plan):
                 raise Exception("Licenza non trovata per questo utente.")
             result = await send_agent_command(license_key, "import", {
                 "connection": {
-                    "host": conn_doc["host"],
-                    "user": conn_doc["user"],
-                    "password": password,
+                    "host": str(conn_doc.get("host") or ""),
+                    "user": str(conn_doc.get("user") or ""),
+                    "password": str(password or ""),
                     "port": conn_doc.get("port", 446)
                 },
-                "library": request.library,
-                "table_name": request.table_name,
-                "mode": request.mode,
+                "library": str(request.library or ""),
+                "table_name": str(request.table_name or ""),
+                "mode": str(request.mode or "create"),
                 "file_url": file_url,
-                "file_ext": ext,
+                "file_content_b64": file_content_b64,
+                "file_ext": str(ext or "csv"),
                 "field_config": request.field_config
             }, timeout=600.0)
         else:
