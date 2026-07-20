@@ -466,7 +466,8 @@ async def _handle_ws_command(ws, action: str, req_id: str, req_data: dict):
                 field_config=req_data.get("field_config")
             )
             
-            res = _sync_import(req)
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, _sync_import, req)
             
             try:
                 import os
