@@ -470,33 +470,35 @@ class AdminLicenseUpdate(BaseModel):
 #  AUTH HELPERS
 # ══════════════════════════════════════════════════════════════
 
-pwd_ctx = CryptContext(schemes=["bcrypt", "sha256_crypt"], deprecated="auto")
+import bcrypt
 
 def hash_password(password: str) -> str:
-    return pwd_ctx.hash(password)
+    pwd_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
 def verify_password(password: str, hashed: str) -> bool:
     if not password or not hashed:
         return False
+    # 1. Direct bcrypt check
     try:
-        if pwd_ctx.verify(password, hashed):
-            return True
-    except Exception:
-        pass
+        if hashed.startswith("$2b$") or hashed.startswith("$2a$") or hashed.startswith("$2y$"):
+            return bcrypt.checkpw(password.encode('utf-8')[:72], hashed.encode('utf-8'))
+    except Exception as e:
+        logger.error(f"Errore bcrypt check: {e}")
+    # 2. Linux crypt check for legacy $5$ hashes
     try:
         import crypt
         if crypt.crypt(password, hashed) == hashed:
             return True
     except Exception:
         pass
+    # 3. Fallback passlib
     try:
-        from passlib.hash import sha256_crypt, pbkdf2_sha256, sha512_crypt
-        for scheme in [sha256_crypt, pbkdf2_sha256, sha512_crypt]:
-            try:
-                if scheme.verify(password, hashed):
-                    return True
-            except Exception:
-                pass
+        from passlib.context import CryptContext
+        pwd_ctx = CryptContext(schemes=["bcrypt", "sha256_crypt"], deprecated="auto")
+        if pwd_ctx.verify(password, hashed):
+            return True
     except Exception:
         pass
     return False
