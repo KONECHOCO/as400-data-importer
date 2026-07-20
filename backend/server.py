@@ -13,14 +13,13 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta, timedelta
-import bcrypt
+from passlib.context import CryptContext
 import jwt
 import secrets
 from bson import ObjectId
 import paypalrestsdk
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
-import resend
 import asyncio
 import json
 
@@ -91,10 +90,11 @@ async def get_decrypted_password_and_migrate(conn_doc: dict) -> str:
     pwd_enc = conn_doc.get("password_enc", "")
     if not pwd_enc:
         return ""
-    if pwd_enc.startswith("enc:"):
+    if pwd_enc.startswith("enc:") or pwd_enc.startswith("gAAAA"):
+        token = pwd_enc[4:] if pwd_enc.startswith("enc:") else pwd_enc
         try:
             f = Fernet(ENCRYPTION_KEY.encode())
-            return f.decrypt(pwd_enc[4:].encode()).decode()
+            return f.decrypt(token.encode()).decode()
         except Exception as e:
             logger.error(f"Errore decifratura Fernet per connessione {conn_doc.get('_id')}: {e}")
             raise HTTPException(status_code=500, detail="Chiave di cifratura non valida o password corrotta.")
@@ -112,6 +112,7 @@ async def get_decrypted_password_and_migrate(conn_doc: dict) -> str:
         except Exception as e:
             logger.error(f"Errore migrazione/decodifica Base64 per connessione {conn_doc.get('_id')}: {e}")
             return pwd_enc
+
 
 def is_select_query(sql: str) -> bool:
     import re
@@ -146,12 +147,9 @@ async def log_audit(user: dict, action: str, connection_id: str, details: str, r
     except Exception as e:
         logger.error(f"Errore scrittura audit log: {e}")
 
-# ── EMAIL (Resend) ───────────────────────────────────────────
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# ── EMAIL (Sendgrid) ─────────────────────────────────────────
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "AS400 Importer <noreply@ikonetsolutions.com>")
-if RESEND_API_KEY:
-    resend.api_key = RESEND_API_KEY
 
 # ── PAYPAL ────────────────────────────────────────────────────
 PAYPAL_CLIENT_ID  = os.environ.get("PAYPAL_CLIENT_ID", "sb")
@@ -418,15 +416,71 @@ class ExportPrepareRequest(BaseModel):
     columns_config: List[ExportColumnConfig]
     send_email: Optional[bool] = False
 
+class AdminUserResponse(BaseModel):
+    id: str
+    mongo_id: str
+    email: str
+    name: str
+    company: str
+    role: str
+    plan: str
+    plan_status: str
+    plan_expires: Optional[datetime] = None
+    trial_ends: Optional[datetime] = None
+    is_active: bool
+    is_admin: bool
+    created_at: datetime
+
+class AdminUserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+    company: str
+    role: Optional[str] = "user"
+    is_admin: Optional[bool] = False
+    plan: Optional[str] = "starter"
+    plan_status: Optional[str] = "trial"
+    trial_ends: Optional[datetime] = None
+    plan_expires: Optional[datetime] = None
+    is_active: Optional[bool] = True
+
+class AdminUserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
+    name: Optional[str] = None
+    company: Optional[str] = None
+    role: Optional[str] = None
+    is_admin: Optional[bool] = None
+    plan: Optional[str] = None
+    plan_status: Optional[str] = None
+    trial_ends: Optional[datetime] = None
+    plan_expires: Optional[datetime] = None
+    is_active: Optional[bool] = None
+
+class AdminLicenseUpdate(BaseModel):
+    user_id: Optional[str] = None
+    plan: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    max_connections: Optional[int] = None
+    notes: Optional[str] = None
+    features: Optional[List[str]] = None
+    revoked: Optional[bool] = None
+
 # ══════════════════════════════════════════════════════════════
 #  AUTH HELPERS
 # ══════════════════════════════════════════════════════════════
 
+pwd_ctx = CryptContext(schemes=["bcrypt", "sha256_crypt"], deprecated="auto")
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return pwd_ctx.hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode(), hashed.encode())
+    try:
+        return pwd_ctx.verify(password, hashed)
+    except Exception as e:
+        logger.error(f"Errore verifica password: {e}")
+        return False
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {
@@ -627,7 +681,7 @@ async def create_connection(data: AS400Connection, user = Depends(require_active
         {"user_id": str(user["_id"]), "is_deleted": {"$ne": True}}
     )
     if not check_plan_limit(user, "connections", count):
-        plan = PLANS.get(user.get("plan", "starter"))
+        plan = PLANS.get(user.get("plan", "starter")) or PLANS["starter"]
         max_conn = plan["limits"]["connections"]
         raise HTTPException(
             status_code=403,
@@ -860,6 +914,89 @@ def _test_as400_connection(host: str, user: str, password: str) -> dict:
     except Exception as e:
         return {"success": False, "message": str(e)}
 
+def smart_read_df(source, ext="csv"):
+    """
+    Lettore intelligente per file Excel, XML, CSV e TXT:
+    - Rilevamento automatico della codifica (utf-8-sig, utf-8, latin-1)
+    - Rilevamento automatico del delimitatore (|, ;, \t, ,, :)
+    - Rilevamento automatico dell'intestazione (header vs no-header)
+    """
+    import pandas as pd
+    import io
+    import csv
+
+    ext = str(ext).lower().lstrip(".")
+    if ext in ["xlsx", "xls"]:
+        if isinstance(source, bytes):
+            return pd.read_excel(io.BytesIO(source))
+        return pd.read_excel(source)
+    elif ext == "xml":
+        if isinstance(source, bytes):
+            return pd.read_xml(io.BytesIO(source))
+        return pd.read_xml(source)
+
+    # File TXT o CSV
+    if isinstance(source, bytes):
+        content_bytes = source
+    else:
+        with open(source, "rb") as f:
+            content_bytes = f.read()
+
+    # 1. Rileva codifica
+    text_sample = None
+    encoding_used = "utf-8-sig"
+    for enc in ["utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            text_sample = content_bytes[:100000].decode(enc)
+            encoding_used = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    if text_sample is None:
+        text_sample = content_bytes[:100000].decode("latin-1", errors="replace")
+        encoding_used = "latin-1"
+
+    # 2. Rileva delimitatore
+    sample_lines = [line for line in text_sample.splitlines()[:30] if line.strip()]
+    delims = ['|', ';', '\t', ',', ':']
+    counts = {d: [line.count(d) for line in sample_lines] for d in delims}
+
+    best_delim = ','
+    best_score = 0
+    for d, line_counts in counts.items():
+        if not line_counts:
+            continue
+        avg_c = sum(line_counts) / len(line_counts)
+        if avg_c > 0:
+            consistent = len(set(line_counts)) == 1
+            score = avg_c * (10 if consistent else 1)
+            if score > best_score:
+                best_score = score
+                best_delim = d
+
+    # 3. Rileva intestazione (header)
+    header = 0
+    try:
+        sample_for_sniffer = "\n".join(sample_lines)
+        if not csv.Sniffer().has_header(sample_for_sniffer):
+            header = None
+    except Exception:
+        header = None
+
+    df = pd.read_csv(
+        io.BytesIO(content_bytes),
+        sep=best_delim,
+        header=header,
+        encoding=encoding_used,
+        dtype=str,
+        on_bad_lines="skip"
+    )
+
+    if header is None:
+        df.columns = [f"COL_{i+1}" for i in range(len(df.columns))]
+
+    return df
+
 # ══════════════════════════════════════════════════════════════
 #  IMPORT
 # ══════════════════════════════════════════════════════════════
@@ -872,15 +1009,9 @@ async def import_preview(file: UploadFile = File(...), user = Depends(require_ac
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
         
         import pandas as pd
-        import io
         
-        # Leggi dataframe
-        if ext in ["xlsx", "xls"]:
-            df = pd.read_excel(io.BytesIO(content))
-        elif ext == "xml":
-            df = pd.read_xml(io.BytesIO(content))
-        else:
-            df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
+        # Leggi dataframe con smart_read_df
+        df = smart_read_df(content, ext)
             
         columns = list(df.columns)
         df_preview = df.head(5).fillna("")
@@ -989,12 +1120,7 @@ async def _run_import(op_id, content, ext, request, user, plan):
         import io
 
         # Leggi dataframe
-        if ext in ["xlsx", "xls"]:
-            df = pd.read_excel(io.BytesIO(content))
-        elif ext == "xml":
-            df = pd.read_xml(io.BytesIO(content))
-        else:
-            df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
+        df = smart_read_df(content, ext)
 
         rows = len(df)
 
@@ -1549,8 +1675,8 @@ def _generate_pdf_bytes(df, filename: str) -> bytes:
     return buffer.getvalue()
 
 async def _send_export_email_task(email: str, name: str, filename: str, file_bytes: bytes, content_type: str):
-    if not SENDGRID_API_KEY and not RESEND_API_KEY:
-        logger.warning("Nessuna chiave API email configurata (Sendgrid/Resend). Invio email saltato.")
+    if not SENDGRID_API_KEY:
+        logger.warning("Nessuna chiave API email configurata (Sendgrid). Invio email saltato.")
         return
         
     import base64
@@ -1563,26 +1689,6 @@ async def _send_export_email_task(email: str, name: str, filename: str, file_byt
 <p style="color:#9ca3af;">Il file richiesto <strong>{filename}</strong> è pronto ed è allegato a questa email.</p>
 <p style="color:#4b5563;font-size:12px;text-align:center;margin-top:40px;">© 2026 Ikonet Solutions</p>
 </div>"""
-
-    if RESEND_API_KEY:
-        try:
-            logger.info("Tentativo invio email con Resend...")
-            resend.Emails.send({
-                "from": SENDER_EMAIL,
-                "to": email,
-                "subject": subject,
-                "html": html,
-                "attachments": [
-                    {
-                        "filename": filename,
-                        "content": list(file_bytes)
-                    }
-                ]
-            })
-            logger.info(f"Email di export inviata via Resend a {email}")
-            return
-        except Exception as e:
-            logger.error(f"Errore invio email con Resend: {e}")
             
     if SENDGRID_API_KEY:
         try:
@@ -1823,8 +1929,8 @@ async def capture_subscription_payment(
 # ══════════════════════════════════════════════════════════════
 
 async def send_welcome_email(email: str, name: str, trial_ends: datetime, license_key: str):
-    if not SENDGRID_API_KEY and not RESEND_API_KEY:
-        logger.warning("Nessuna chiave API email configurata (Sendgrid/Resend). Welcome email non inviata.")
+    if not SENDGRID_API_KEY:
+        logger.warning("Nessuna chiave API email configurata (Sendgrid). Welcome email non inviata.")
         return
 
     subject = "Benvenuto su AS400 Data Importer — 14 giorni gratis!"
@@ -1847,19 +1953,19 @@ async def send_welcome_email(email: str, name: str, trial_ends: datetime, licens
     <h2 style="font-size:16px;font-weight:700;color:#3b82f6;margin-top:0;margin-bottom:10px;">
       Scarica e installa l'applicazione
     </h2>
-    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:20px;">Clicca il pulsante per scaricare il programma per Windows (51 MB). Dopo l'installazione avvialo dal desktop.</p>
+    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:20px;">Clicca il pulsante per scaricare l'installer dell'Agente per Windows (circa 100 MB). Durante l'installazione, inserisci la chiave di licenza riportata sotto quando richiesto.</p>
     <div style="text-align:center;margin-bottom:15px;">
-      <a href="{FRONTEND_URL}/agent.exe" style="background:#2563eb;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;border:1px solid #3b82f6;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);">⬇ Scarica AS400 Data Importer (.exe)</a>
+      <a href="{FRONTEND_URL}/AS400AgentSetup.exe" style="background:#2563eb;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;border:1px solid #3b82f6;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);">⬇ Scarica Installer Agente (.exe)</a>
     </div>
-    <div style="color:#64748b;font-size:11px;text-align:center;">Windows 10/11 — 64 bit · Richiede Java (JRE 8+)</div>
+    <div style="color:#64748b;font-size:11px;text-align:center;">Windows 10/11 (64-bit) — Tutto incluso (Java JRE 17 integrato, non richiede installazioni esterne)</div>
   </div>
 
   <!-- Step 2 -->
   <div style="margin-bottom:30px;background:#151824;padding:20px;border-radius:12px;border:1px solid #1e293b;">
     <h2 style="font-size:16px;font-weight:700;color:#10b981;margin-top:0;margin-bottom:10px;">
-      Attiva la licenza di prova
+      La tua licenza di prova
     </h2>
-    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:15px;">Avvia l'applicazione sul tuo PC e inserisci la seguente licenza di prova gratuita (valida per 14 giorni):</p>
+    <p style="color:#94a3b8;font-size:14px;line-height:1.5;margin-bottom:15px;">Copia questa chiave di licenza di prova gratuita (valida per 14 giorni) e incollala nella procedura d'installazione guidata:</p>
     <div style="background:#0d0f1a;border:1px dashed #10b981;color:#34d399;padding:14px;border-radius:8px;font-family:monospace;font-size:18px;text-align:center;letter-spacing:1px;font-weight:700;margin:15px 0;">
       {license_key}
     </div>
@@ -1872,20 +1978,6 @@ async def send_welcome_email(email: str, name: str, trial_ends: datetime, licens
     <p style="color:#475569;font-size:11px;margin-top:20px;">© 2026 Ikonet Solutions</p>
   </div>
 </div>"""
-
-    if RESEND_API_KEY:
-        try:
-            logger.info("Tentativo invio welcome email con Resend...")
-            resend.Emails.send({
-                "from": SENDER_EMAIL,
-                "to": email,
-                "subject": subject,
-                "html": html_content
-            })
-            logger.info(f"Welcome email inviata via Resend a {email}")
-            return
-        except Exception as e:
-            logger.error(f"Errore welcome email Resend: {e}")
 
     if SENDGRID_API_KEY:
         try:
@@ -1940,7 +2032,7 @@ async def health():
 async def forgot_password(data: dict, background_tasks: BackgroundTasks):
     email = data.get("email", "").lower()
     user = await db.users.find_one({"email": email})
-    if user and RESEND_API_KEY:
+    if user and SENDGRID_API_KEY:
         token = secrets.token_urlsafe(32)
         await db.users.update_one(
             {"_id": user["_id"]},
@@ -1994,7 +2086,7 @@ async def reset_password(data: dict):
         raise HTTPException(status_code=400, detail="Token scaduto")
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {"password": __import__("bcrypt").hashpw(password.encode(), __import__("bcrypt").gensalt()).decode()},
+        {"$set": {"password": hash_password(password)},
          "$unset": {"reset_token": "", "reset_expires": ""}}
     )
     return {"message": "Password aggiornata con successo"}
@@ -2037,9 +2129,6 @@ async def send_trial_reminders(user = Depends(get_current_user)):
         await db.users.update_one({"_id": u["_id"]}, {"$set": {"trial_reminder_sent": True}})
     return {"sent": sent}
 
-# Serve frontend statico
-if os.path.exists("/app/frontend/build"):
-    app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
 
 # Forgot password endpoint (aggiunto)
 
@@ -2161,4 +2250,192 @@ async def reset_hardware(license_key: str, user=Depends(get_current_user)):
     )
     return {"message": "Hardware reset eseguito"}
 
+# ── ADMIN USER CRUD ──────────────────────────────────────────
+
+@api_router.get("/admin/users", response_model=List[AdminUserResponse])
+async def admin_list_users(user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    users = await db.users.find().sort("created_at", -1).to_list(1000)
+    res = []
+    for u in users:
+        res.append(AdminUserResponse(
+            id=u.get("id") or str(u["_id"]),
+            mongo_id=str(u["_id"]),
+            email=u["email"],
+            name=u.get("name", ""),
+            company=u.get("company", ""),
+            role=u.get("role", "user"),
+            plan=u.get("plan", "starter"),
+            plan_status=u.get("plan_status", "trial"),
+            plan_expires=u.get("plan_expires"),
+            trial_ends=u.get("trial_ends"),
+            is_active=u.get("is_active", True),
+            is_admin=u.get("is_admin", False),
+            created_at=u.get("created_at") or datetime.now(timezone.utc)
+        ))
+    return res
+
+@api_router.post("/admin/users")
+async def admin_create_user(req: AdminUserCreate, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    
+    existing = await db.users.find_one({"email": req.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email già registrata")
+        
+    user_id = str(uuid.uuid4())
+    trial_ends = req.trial_ends or (datetime.now(timezone.utc) + timedelta(days=14))
+    
+    new_user = {
+        "_id": ObjectId(),
+        "id": user_id,
+        "email": req.email.lower(),
+        "password": hash_password(req.password),
+        "name": req.name,
+        "company": req.company,
+        "role": req.role,
+        "plan": req.plan,
+        "plan_status": req.plan_status,
+        "plan_expires": req.plan_expires,
+        "trial_ends": trial_ends,
+        "is_active": req.is_active,
+        "is_admin": req.is_admin,
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.users.insert_one(new_user)
+    
+    if req.plan_status == "trial":
+        key = generate_license_key(user_id)
+        license_doc = {
+            "license_key": key,
+            "user_id": user_id,
+            "plan": req.plan,
+            "expires_at": trial_ends,
+            "max_connections": 1,
+            "notes": "Licenza di prova creata automaticamente dall'admin",
+            "revoked": False,
+            "hardware_id": None,
+            "hostname": None,
+            "suspicious_attempts": 0,
+            "features": ["import", "export", "query"],
+            "created_at": datetime.now(timezone.utc)
+        }
+        await db.licenses.insert_one(license_doc)
+        
+    return {"message": "Utente creato con successo", "user_id": user_id}
+
+@api_router.put("/admin/users/{mongo_id}")
+async def admin_update_user(mongo_id: str, req: AdminUserUpdate, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    
+    target_user = await db.users.find_one({"_id": ObjectId(mongo_id)})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+        
+    update_data = {}
+    if req.name is not None:
+        update_data["name"] = req.name
+    if req.email is not None:
+        existing = await db.users.find_one({"email": req.email.lower(), "_id": {"$ne": ObjectId(mongo_id)}})
+        if existing:
+            raise HTTPException(status_code=400, detail="Email già utilizzata da un altro utente")
+        update_data["email"] = req.email.lower()
+    if req.password is not None and req.password.strip() != "":
+        update_data["password"] = hash_password(req.password)
+    if req.company is not None:
+        update_data["company"] = req.company
+    if req.role is not None:
+        update_data["role"] = req.role
+    if req.is_admin is not None:
+        update_data["is_admin"] = req.is_admin
+    if req.plan is not None:
+        update_data["plan"] = req.plan
+    if req.plan_status is not None:
+        update_data["plan_status"] = req.plan_status
+    if req.trial_ends is not None:
+        update_data["trial_ends"] = req.trial_ends
+    if req.plan_expires is not None:
+        update_data["plan_expires"] = req.plan_expires
+    if req.is_active is not None:
+        update_data["is_active"] = req.is_active
+        
+    if update_data:
+        await db.users.update_one({"_id": ObjectId(mongo_id)}, {"$set": update_data})
+        
+    return {"message": "Utente aggiornato con successo"}
+
+@api_router.delete("/admin/users/{mongo_id}")
+async def admin_delete_user(mongo_id: str, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    
+    target_user = await db.users.find_one({"_id": ObjectId(mongo_id)})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+        
+    await db.users.delete_one({"_id": ObjectId(mongo_id)})
+    
+    user_uuid = target_user.get("id")
+    if user_uuid:
+        await db.licenses.delete_many({"user_id": user_uuid})
+        await db.connections.delete_many({"user_id": user_uuid})
+    
+    await db.licenses.delete_many({"user_id": mongo_id})
+    await db.connections.delete_many({"user_id": mongo_id})
+    
+    return {"message": "Utente e relative risorse eliminati con successo"}
+
+# ── ADMIN LICENSE EXTRA CRUD ─────────────────────────────────
+
+@api_router.put("/admin/licenses/{license_key}")
+async def admin_update_license(license_key: str, req: AdminLicenseUpdate, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+        
+    lic = await db.licenses.find_one({"license_key": license_key})
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+        
+    update_data = {}
+    if req.user_id is not None:
+        update_data["user_id"] = req.user_id
+    if req.plan is not None:
+        update_data["plan"] = req.plan
+    if req.expires_at is not None:
+        update_data["expires_at"] = req.expires_at
+    if req.max_connections is not None:
+        update_data["max_connections"] = req.max_connections
+    if req.notes is not None:
+        update_data["notes"] = req.notes
+    if req.features is not None:
+        update_data["features"] = req.features
+    if req.revoked is not None:
+        update_data["revoked"] = req.revoked
+        if req.revoked:
+            update_data["revoked_at"] = datetime.now(timezone.utc)
+            
+    if update_data:
+        await db.licenses.update_one({"license_key": license_key}, {"$set": update_data})
+        
+    return {"message": "Licenza aggiornata con successo"}
+
+@api_router.delete("/admin/licenses/{license_key}")
+async def admin_delete_license(license_key: str, user=Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+        
+    result = await db.licenses.delete_one({"license_key": license_key})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+        
+    return {"message": "Licenza eliminata con successo"}
+
 app.include_router(api_router)
+
+# Serve frontend statico
+if os.path.exists("/app/frontend/build"):
+    app.mount("/", StaticFiles(directory="/app/frontend/build", html=True), name="frontend")
+

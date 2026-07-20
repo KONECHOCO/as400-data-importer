@@ -4,6 +4,24 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from pathlib import Path
 
+# Setup local JRE path if present
+if getattr(sys, 'frozen', False):
+    app_dir = Path(sys.executable).parent
+else:
+    app_dir = Path(__file__).parent
+
+local_jre_candidates = [app_dir / "jre", app_dir / "jdk"]
+for candidate in local_jre_candidates:
+    if candidate.exists():
+        # Look for subdirectories (e.g. jdk-17.0.19+10-jre) inside extracted zip
+        subdirs = [d for d in candidate.iterdir() if d.is_dir() and (d / "bin").exists()]
+        if subdirs:
+            os.environ["JAVA_HOME"] = str(subdirs[0])
+            break
+        elif (candidate / "bin").exists():
+            os.environ["JAVA_HOME"] = str(candidate)
+            break
+
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,7 +113,7 @@ class ImportRequest(BaseModel):
 class QueryRequest(BaseModel):
     connection: AS400Connection
     sql: str
-    limit: int = 1000
+    limit: Optional[int] = 1000
 
 class ActivateRequest(BaseModel):
     license_key: str
@@ -175,13 +193,16 @@ def _test_as400_connection(host: str, user: str, password: str) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def _run_as400_query(conn_obj: AS400Connection, sql: str, limit: int) -> dict:
+def _run_as400_query(conn_obj: AS400Connection, sql: str, limit: Optional[int]) -> dict:
     try:
         conn = _open_as400_connection(conn_obj.host, conn_obj.user, conn_obj.password)
         cursor = conn.cursor()
         cursor.execute(sql)
         columns = [d[0] for d in cursor.description] if cursor.description else []
-        rows = cursor.fetchmany(limit)
+        if limit is not None and limit > 0:
+            rows = cursor.fetchmany(limit)
+        else:
+            rows = cursor.fetchall()
         cursor.close(); conn.close()
         return {"success": True, "columns": columns, "rows": [list(r) for r in rows], "count": len(rows)}
     except Exception as e:
@@ -200,18 +221,91 @@ async def _run_import(op_id: str, req: ImportRequest):
         operations[op_id].update({"status": "failed", "error": str(e),
             "completed_at": datetime.now(timezone.utc).isoformat()})
 
+def smart_read_df(source, ext="csv"):
+    import pandas as pd
+    import io
+    import csv
+
+    ext = str(ext).lower().lstrip(".")
+    if ext in ["xlsx", "xls"]:
+        if isinstance(source, bytes):
+            return pd.read_excel(io.BytesIO(source))
+        return pd.read_excel(source)
+    elif ext == "xml":
+        if isinstance(source, bytes):
+            return pd.read_xml(io.BytesIO(source))
+        return pd.read_xml(source)
+
+    if isinstance(source, bytes):
+        content_bytes = source
+    else:
+        with open(source, "rb") as f:
+            content_bytes = f.read()
+
+    text_sample = None
+    encoding_used = "utf-8-sig"
+    for enc in ["utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            text_sample = content_bytes[:100000].decode(enc)
+            encoding_used = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    if text_sample is None:
+        text_sample = content_bytes[:100000].decode("latin-1", errors="replace")
+        encoding_used = "latin-1"
+
+    sample_lines = [line for line in text_sample.splitlines()[:30] if line.strip()]
+    delims = ['|', ';', '\t', ',', ':']
+    counts = {d: [line.count(d) for line in sample_lines] for d in delims}
+
+    best_delim = ','
+    best_score = 0
+    for d, line_counts in counts.items():
+        if not line_counts:
+            continue
+        avg_c = sum(line_counts) / len(line_counts)
+        if avg_c > 0:
+            consistent = len(set(line_counts)) == 1
+            score = avg_c * (10 if consistent else 1)
+            if score > best_score:
+                best_score = score
+                best_delim = d
+
+    header = 0
+    try:
+        sample_for_sniffer = "\n".join(sample_lines)
+        if not csv.Sniffer().has_header(sample_for_sniffer):
+            header = None
+    except Exception:
+        header = None
+
+    df = pd.read_csv(
+        io.BytesIO(content_bytes),
+        sep=best_delim,
+        header=header,
+        encoding=encoding_used,
+        dtype=str,
+        on_bad_lines="skip"
+    )
+
+    if header is None:
+        df.columns = [f"COL_{i+1}" for i in range(len(df.columns))]
+
+    return df
+
 def _sync_import(req: ImportRequest) -> dict:
     import pandas as pd
     file_path = Path(req.file_path)
     if not file_path.exists():
         return {"success": False, "error": f"File non trovato: {req.file_path}"}
-    ext = file_path.suffix.lower()
-    if ext in [".xlsx", ".xls"]:
-        df = pd.read_excel(file_path)
-    elif ext == ".csv":
-        df = pd.read_csv(file_path)
-    else:
-        return {"success": False, "error": f"Formato non supportato: {ext}"}
+    ext = file_path.suffix.lower().lstrip(".")
+    if ext not in ["xlsx", "xls", "csv", "txt", "xml"]:
+        return {"success": False, "error": f"Formato non supportato: .{ext}"}
+    try:
+        df = smart_read_df(file_path, ext)
+    except Exception as read_err:
+        return {"success": False, "error": f"Errore lettura file: {read_err}"}
     if df.empty:
         return {"success": False, "error": "File vuoto"}
     if req.field_config:
@@ -394,5 +488,5 @@ async def _license_loop():
         await verify_license_with_cloud()
 
 if __name__ == "__main__":
-    uvicorn.run("agent:app", host="0.0.0.0", port=AGENT_PORT, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, reload=False)
 
